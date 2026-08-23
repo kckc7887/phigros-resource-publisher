@@ -228,7 +228,8 @@ def main() -> None:
 
     # ---- 阶段 5：汇总与归档 ----
     elapsed = time.monotonic() - started
-    _write_summary(repo_root / "work" / "artifacts", release, upload, latest["version"], elapsed)
+    # 用清洗后的版本号，与实际上传 key / manifest / current.json 保持一致。
+    _write_summary(repo_root / "work" / "artifacts", release, upload, release["version"], elapsed)
     if upload.get("current_url"):
         _log(f"current.json 地址：{upload['current_url']}")
     _log(f"全量发布完成，总耗时 {elapsed / 60:.1f} 分钟")
