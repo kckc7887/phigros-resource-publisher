@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rRanker · Phigros 资源发布台</title>
+    <link rel="stylesheet" href="/styles.css?v=20260720-actions" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">rRanker / Local publishing lab</p>
+          <h1>Phigros 资源发布台</h1>
+          <p class="lede">仅解析、解析并上传，或只上传已有结果中的指定资源。</p>
+        </div>
+        <div class="hero-mark" aria-hidden="true"><span>φ</span></div>
+      </header>
+
+      <section class="notice">
+        <strong>本机工具</strong>
+        <span>Access Key 与 Secret Key 仅随本次 localhost 请求进入内存，不写入文件或日志。</span>
+      </section>
+
+      <div class="grid">
+        <section class="panel controls">
+          <div class="panel-title">
+            <div><span class="step">01</span><h2>选择流程</h2></div>
+            <span class="pill">SCOPED ACTIONS</span>
+          </div>
+
+          <label class="field">
+            <span>执行动作</span>
+            <select id="action">
+              <option value="parse">仅解析整理</option>
+              <option value="full">解析并上传</option>
+              <option value="upload">仅上传已有结果</option>
+            </select>
+            <small id="actionHint">解包整理到 work/latest，不连接对象存储。</small>
+          </label>
+
+          <div id="sourceFields">
+            <label class="field">
+              <span>APK 来源</span>
+              <select id="mode">
+                <option value="local">本地 APK</option>
+                <option value="live">下载最新 APK</option>
+              </select>
+              <small id="modeHint">选择本机已有 APK。</small>
+            </label>
+
+            <div id="localFields">
+              <label class="field">
+                <span>本地 APK 路径</span>
+                <div class="path-row">
+                  <input id="apkPath" autocomplete="off" placeholder="D:\Downloads\Phigros_3.19.4.apk" />
+                  <button id="pickApk" type="button" class="secondary">选择文件…</button>
+                </div>
+                <small>文件名需为 Phigros_&lt;版本&gt;.apk，版本号将用于 releases 目录。</small>
+              </label>
+            </div>
+          </div>
+
+          <div id="uploadFields" class="upload-fields" hidden>
+            <label class="field">
+              <span>上传范围</span>
+              <select id="uploadScope"></select>
+              <small id="scopeHint">全量上传成功后会清理桶内旧版本；局部上传不会删除其他对象。</small>
+            </label>
+            <label class="field"><span>API 端点</span><input id="endpoint" /></label>
+            <label class="field"><span>Bucket</span><input id="bucket" /></label>
+            <label class="field"><span>公开访问地址</span><input id="publicBase" /></label>
+            <div class="two-col">
+              <label class="field"><span>Access Key</span><input id="accessKey" type="password" autocomplete="off" /></label>
+              <label class="field"><span>Secret Key</span><input id="secretKey" type="password" autocomplete="off" /></label>
+            </div>
+            <p class="field-note">本地产物始终只保留 work/latest 最新一份。「仅上传」复用已有解析结果，不会重新解包。</p>
+          </div>
+
+          <button id="start" class="primary">开始执行</button>
+        </section>
+
+        <section class="panel monitor">
+          <div class="panel-title">
+            <div><span class="step">02</span><h2>任务状态</h2></div>
+            <span id="statusBadge" class="status idle">IDLE</span>
+          </div>
+          <div class="stage-list" aria-label="发布步骤">
+            <span data-stage="resolve">解析版本</span>
+            <span data-stage="probe">HTTP 200</span>
+            <span data-stage="apk">准备 APK</span>
+            <span data-stage="extract">解包</span>
+            <span data-stage="organize">整理</span>
+            <span data-stage="upload">上传</span>
+          </div>
+          <div class="progress-track"><div id="progressBar"></div></div>
+          <div class="status-copy">
+            <strong id="message">等待开始</strong>
+            <span id="progressText">0%</span>
+          </div>
+          <pre id="logs" class="logs">尚无日志。</pre>
+          <div id="result" class="result" hidden></div>
+        </section>
+      </div>
+    </main>
+    <script src="/app.js?v=20260720-actions"></script>
+  </body>
+</html>
