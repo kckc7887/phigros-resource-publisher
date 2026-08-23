@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import mimetypes
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 
@@ -41,6 +43,8 @@ def _make_s3_client(boto3: Any, Config: Any, config: dict[str, Any]) -> Any:
     config_kwargs: dict[str, Any] = {
         "signature_version": "s3v4",
         "s3": {"addressing_style": "path"},
+        # 跨境链路抖动重试：自适应模式，最多 10 次尝试。
+        "retries": {"max_attempts": 10, "mode": "adaptive"},
     }
     # boto3>=1.36 默认改用 CRC；兼容端常仍强制 DeleteObjects 要 Content-MD5。
     try:
@@ -157,14 +161,14 @@ def upload_release(
         raise ValueError(f"上传范围 {scope} 没有匹配到任何本地文件")
 
     uploaded_keys: list[str] = []
-    for index, (path, relative) in enumerate(selected, start=1):
-        key = f"phigros/releases/{version}/{relative}"
+
+    def _upload_asset(s3_client: Any, path: Path, key: str) -> None:
         content_type = (
             _CONTENT_TYPE_OVERRIDES.get(path.suffix.lower())
             or mimetypes.guess_type(path.name)[0]
             or "application/octet-stream"
         )
-        client.upload_file(
+        s3_client.upload_file(
             str(path),
             bucket,
             key,
@@ -173,9 +177,46 @@ def upload_release(
                 "CacheControl": "public, max-age=31536000, immutable",
             },
         )
-        uploaded_keys.append(key)
-        if progress:
-            progress(index, total, key)
+
+    try:
+        max_workers = int(config.get("max_workers") or 8)
+    except (TypeError, ValueError):
+        max_workers = 8
+    max_workers = max(1, min(max_workers, 32))
+
+    if max_workers <= 1:
+        for index, (path, relative) in enumerate(selected, start=1):
+            key = f"phigros/releases/{version}/{relative}"
+            _upload_asset(client, path, key)
+            uploaded_keys.append(key)
+            if progress:
+                progress(index, total, key)
+    else:
+        # 跨境上传小文件多、延迟高，串行会被 RTT 拖垮；并行上传。
+        # boto3 客户端不建议跨线程共享使用：每线程独立持有客户端。
+        thread_local = threading.local()
+
+        def _thread_client() -> Any:
+            s3_client = getattr(thread_local, "client", None)
+            if s3_client is None:
+                s3_client = _make_s3_client(boto3, Config, config)
+                thread_local.client = s3_client
+            return s3_client
+
+        def _task(path: Path, key: str) -> str:
+            _upload_asset(_thread_client(), path, key)
+            return key
+
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="s3-upload") as pool:
+            futures = {
+                pool.submit(_task, path, f"phigros/releases/{version}/{relative}")
+                for path, relative in selected
+            }
+            for index, future in enumerate(as_completed(futures), start=1):
+                key = future.result()
+                uploaded_keys.append(key)
+                if progress:
+                    progress(index, total, key)
 
     if include_current:
         current_path = Path(release_result["current_path"])
