@@ -16,6 +16,8 @@
 
 密钥只经 Secrets 注入环境变量，不写入日志与文件。
 
+另有一个可选 Variable（**Settings → Secrets and variables → Actions → Variables**）：`S3_UPLOAD_WORKERS`，并行上传线程数（1-32，默认 8）。GitHub runner 在海外、对象存储多在国内，跨境传两千多个小文件时串行会被往返延迟拖垮，因此并行上传默认开启；嫌占带宽可调小，追求更快可调大（如 16）。
+
 ## 使用方法
 
 1. 把本仓库推到 GitHub（或直接在本仓库操作）。
@@ -31,7 +33,9 @@
 1. **下载**：通过 TapTap 接口查询最新 Phigros 版本，校验下载地址（HTTP 200）后流式下载 APK。
 2. **全量解包**：内置 phiTool 工具链解出头像、全谱面、曲绘（原图 / 模糊 / 低清）、**全曲 `.ogg` 音乐**、元数据，并统计全曲物量表；音乐重建依赖系统 `libogg` / `libvorbis`（工作流自动 apt 安装）。
 3. **整理**：生成发布目录与 `manifest.json`（逐文件 SHA-256）、`catalog.json`、`note_counts.tsv`、`current.json`。
-4. **全量上传**：把 `phigros/releases/<版本>/` 全部资产上传到对象存储，最后上传 `phigros/current.json`（no-cache）；随后清空桶内 `phigros/releases/` 下所有旧对象，仅保留本次上传。
+4. **全量上传**：把 `phigros/releases/<版本>/` 全部资产**多线程并行**上传到对象存储（跨境小文件多，并行掩盖往返延迟），最后上传 `phigros/current.json`（no-cache）；随后清空桶内 `phigros/releases/` 下所有旧对象，仅保留本次上传。
+
+整个工作流超时上限 6 小时（runner 在海外，跨境下载与上传都偏慢，属正常）；上传中途失败可直接重跑，同 key 覆盖写，无副作用。
 
 ## 发布产物结构
 

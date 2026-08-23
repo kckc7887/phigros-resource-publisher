@@ -15,7 +15,7 @@ jobs:
   publish:
     name: 下载-全量解包-全量上传
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360  # 平台上限 6 小时：runner 在海外，跨境下载/上传都慢，留足余量
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -48,6 +48,8 @@ jobs:
           S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
           S3_PUBLIC_BASE: ${{ secrets.S3_PUBLIC_BASE }}
+          # 可选：在 Settings → Variables 里建 S3_UPLOAD_WORKERS 调整并行上传线程数（默认 8）
+          S3_UPLOAD_WORKERS: ${{ vars.S3_UPLOAD_WORKERS }}
         run: python publish.py
 
       - name: 归档发布清单

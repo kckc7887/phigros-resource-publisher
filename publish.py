@@ -10,6 +10,7 @@
 可选环境变量：
     S3_ENDPOINT    S3 兼容端点（默认雨云 https://cn-nb1.rains3.com）
     S3_PUBLIC_BASE 公网访问基址（仅用于汇总中的 current_url）
+    S3_UPLOAD_WORKERS 并行上传线程数，1-32（默认 8；跨境传小文件多，串行会被延迟拖垮）
 """
 
 from __future__ import annotations
@@ -64,6 +65,17 @@ def _reset_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _load_upload_workers() -> int:
+    """并行上传线程数：默认 8，可经 S3_UPLOAD_WORKERS 调整（1-32）。"""
+    raw = os.environ.get("S3_UPLOAD_WORKERS", "").strip()
+    if not raw:
+        return 8
+    try:
+        return max(1, min(int(raw), 32))
+    except ValueError:
+        raise SystemExit(f"S3_UPLOAD_WORKERS 需为 1-32 的整数，当前值：{raw!r}")
 
 
 def _download_progress() -> Callable[[int, int], None]:
@@ -158,7 +170,11 @@ def main() -> None:
     started = time.monotonic()
     repo_root = Path(__file__).resolve().parent
     config = _load_config()
-    _log(f"对象存储：endpoint={config['endpoint']} bucket={config['bucket']}")
+    upload_workers = _load_upload_workers()
+    _log(
+        f"对象存储：endpoint={config['endpoint']} bucket={config['bucket']}"
+        f"（并行上传 {upload_workers} 线程）"
+    )
 
     # ---- 阶段 1：查询并下载最新 APK ----
     _log("正在查询 TapTap 最新 Phigros 版本")
@@ -211,13 +227,14 @@ def main() -> None:
     _log("已删除解包中间产物以释放磁盘")
 
     # ---- 阶段 4：全量上传 ----
-    _log("开始全量上传（上传后清空桶内 phigros/releases/ 旧对象）")
+    _log(f"开始全量上传（{upload_workers} 线程并行，上传后清空桶内 phigros/releases/ 旧对象）")
     upload = upload_release(
         release,
         {
             **config,
             "upload_scope": UPLOAD_SCOPE,
             "delete_previous": DELETE_PREVIOUS,
+            "max_workers": upload_workers,
         },
         _item_progress("上传", 10),
     )
@@ -228,7 +245,8 @@ def main() -> None:
 
     # ---- 阶段 5：汇总与归档 ----
     elapsed = time.monotonic() - started
-    _write_summary(repo_root / "work" / "artifacts", release, upload, latest["version"], elapsed)
+    # 用清洗后的版本号，与实际上传 key / manifest / current.json 保持一致。
+    _write_summary(repo_root / "work" / "artifacts", release, upload, release["version"], elapsed)
     if upload.get("current_url"):
         _log(f"current.json 地址：{upload['current_url']}")
     _log(f"全量发布完成，总耗时 {elapsed / 60:.1f} 分钟")
