@@ -7,6 +7,8 @@ import json
 import mimetypes
 from pathlib import Path
 import shutil
+import re
+from uuid import uuid4
 from typing import Any, Callable
 
 from .chart_notes import write_note_counts_tsv
@@ -74,6 +76,67 @@ def build_catalog(metadata_dir: Path) -> dict[str, Any]:
     return {"schemaVersion": 1, "songCount": len(songs), "songs": songs}
 
 
+def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, Any]:
+    missing: list[str] = []
+    songs = catalog["songs"]
+    if not songs or catalog["songCount"] != len(songs):
+        missing.append("catalog songs")
+    for song in songs:
+        song_id = song["id"]
+        music = root / "music" / f"{song_id}.ogg"
+        if not music.is_file() or music.stat().st_size < 27:
+            missing.append(f"music/{song_id}.ogg")
+        else:
+            with music.open("rb") as source:
+                header = source.read(64)
+            if not header.startswith(b"OggS") or b"\x01vorbis" not in header:
+                missing.append(f"music/{song_id}.ogg (invalid OGG/Vorbis)")
+        for directory in ("illustrations", "illustrations-blur", "illustrations-lowres"):
+            image = root / directory / f"{song_id}.png"
+            if not image.is_file() or image.stat().st_size == 0:
+                missing.append(f"{directory}/{song_id}.png")
+        chart_root = root / "charts"
+        chart_dirs = [path for path in chart_root.iterdir() if path.is_dir()
+                      and re.fullmatch(re.escape(song_id) + r"(?:\.\d+)?", path.name)] if chart_root.is_dir() else []
+        for index, constant in enumerate(song["difficulties"]):
+            if constant <= 0:
+                continue
+            level = ("EZ", "HD", "IN", "AT")[index]
+            files = [path / f"{level}.json" for path in chart_dirs if (path / f"{level}.json").is_file()]
+            if len(files) != 1 or files[0].stat().st_size == 0:
+                missing.append(f"charts/{song_id}/{level}.json")
+    report = {"songCount": len(songs), "musicCount": len(list((root / "music").glob("*.ogg"))),
+              "missingResources": missing}
+    if missing:
+        raise ValueError("发布资源不完整：" + json.dumps(report, ensure_ascii=False))
+    return report
+
+
+def validate_release(release: dict[str, Any]) -> dict[str, Any]:
+    root = Path(release["version_dir"]).resolve()
+    catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
+    report = validate_catalog_assets(root, catalog)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    current = json.loads(Path(release["current_path"]).read_text(encoding="utf-8"))
+    if (current.get("manifestSha256") != _sha256(manifest_path)
+            or manifest["gameVersion"] != current["gameVersion"]
+            or manifest["generatedAt"] != current["publishedAt"]):
+        raise ValueError("发布清单与 current.json 不一致")
+    listed = set()
+    for asset in manifest["assets"]:
+        target = (root / asset["path"]).resolve()
+        if not target.is_relative_to(root) or asset["path"] in listed:
+            raise ValueError("发布清单路径重复或越界")
+        listed.add(asset["path"])
+        if not target.is_file() or target.stat().st_size != asset["size"] or _sha256(target) != asset["sha256"]:
+            raise ValueError(f"发布资源校验失败：{asset['path']}")
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name != "manifest.json"}
+    if listed != actual or manifest["assetCount"] != len(listed):
+        raise ValueError("发布清单文件集合不完整")
+    return report
+
+
 def organize_release(
     extracted_output: Path,
     release_root: Path,
@@ -98,6 +161,8 @@ def organize_release(
         json.dumps(build_catalog(metadata_dir), ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
+
+    validation = validate_catalog_assets(version_dir, build_catalog(metadata_dir))
 
     charts_dir = version_dir / "charts"
     note_counts = write_note_counts_tsv(
@@ -142,7 +207,8 @@ def organize_release(
     current = {
         "schemaVersion": 1,
         "gameVersion": version,
-        "resourceVersion": f"{version}-{datetime.now().astimezone().strftime('%Y%m%d%H%M%S')}",
+        "resourceVersion": f"{version}-{uuid4().hex}",
+        "manifestSha256": _sha256(manifest_path),
         "publishedAt": generated_at,
         "manifest": f"phigros/releases/{version}/manifest.json",
         "catalog": f"phigros/releases/{version}/catalog.json",
@@ -161,6 +227,7 @@ def organize_release(
         "asset_count": len(assets),
         "total_bytes": manifest["totalBytes"],
         "note_counts": note_counts,
+        "validation": validation,
         "current": current,
     }
 

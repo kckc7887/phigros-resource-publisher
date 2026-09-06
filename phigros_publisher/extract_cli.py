@@ -42,6 +42,17 @@ def _ensure_output_dirs(output_root: Path, config: dict) -> dict[str, Path]:
     return dirs
 
 
+def preflight_audio() -> None:
+    try:
+        from fsb5 import vorbis
+        for library, symbol in ((vorbis.ogg, "ogg_stream_init"),
+                                (vorbis.vorbis, "vorbis_info_init"),
+                                (vorbis.vorbisenc, "vorbis_encode_setup_init")):
+            getattr(library, symbol)
+    except Exception as error:
+        raise RuntimeError("音乐重建依赖不可用；Linux 需安装 libogg0、libvorbis0a、libvorbisenc2") from error
+
+
 def run_extract(script_dir: Path, apk_path: Path, music: bool = False) -> None:
     os.chdir(script_dir)
     sys.path.insert(0, str(script_dir))
@@ -50,6 +61,8 @@ def run_extract(script_dir: Path, apk_path: Path, music: bool = False) -> None:
     from log import init_console_logger
     from resource import run as extract_resources
 
+    if music:
+        preflight_audio()
     config = _publish_extract_config(music=music)
     output_root = script_dir.parent / "output"
     metadata_dir = output_root / "metadata"

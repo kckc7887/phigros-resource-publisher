@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import threading
 from typing import Any, Callable
+from .organizer import validate_release
 
 
 UPLOAD_SCOPES = {
@@ -149,6 +150,7 @@ def upload_release(
         raise ValueError(f"上传配置缺少：{', '.join(missing)}")
 
     scope = normalize_upload_scope(config.get("upload_scope"))
+    validate_release(release_result)
     boto3, Config = _load_boto3()
     client = _make_s3_client(boto3, Config, config)
     bucket = config["bucket"]

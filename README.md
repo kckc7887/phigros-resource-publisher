@@ -1,6 +1,6 @@
 # Phigros 全量发布（GitHub Actions 版）
 
-只有一个手动触发的工作流：填好密钥 → 手动 Run → 自动完成 **下载最新 APK → 全量解包（含全曲音乐）→ 全量上传**。音乐等大文件一律提取、一律上传，不做任何裁剪。
+发布工作流仅在手动触发时上传资源；push / pull request 只执行 Linux 依赖预检和测试。手动发布：填好密钥 → 手动 Run → 自动完成 **下载最新 APK → 全量解包（含全曲音乐）→ 全量上传**。音乐等大文件一律提取、一律上传，不做任何裁剪。
 
 ## 需要配置的 Secrets
 
@@ -32,10 +32,10 @@
 
 1. **下载**：通过 TapTap 接口查询最新 Phigros 版本，校验下载地址（HTTP 200）后流式下载 APK。
 2. **全量解包**：内置 phiTool 工具链解出头像、全谱面、曲绘（原图 / 模糊 / 低清）、**全曲 `.ogg` 音乐**、元数据，并统计全曲物量表；音乐重建依赖系统 `libogg` / `libvorbis`（工作流自动 apt 安装）。
-3. **整理**：生成发布目录与 `manifest.json`（逐文件 SHA-256）、`catalog.json`、`note_counts.tsv`、`current.json`。
+3. **整理**：生成发布目录与 `manifest.json`（逐文件 SHA-256）、`catalog.json`、`note_counts.tsv`、`current.json`（包含独立资源修订号与 `manifestSha256`）。
 4. **全量上传**：把 `phigros/releases/<版本>/` 全部资产**多线程并行**上传到对象存储（跨境小文件多，并行掩盖往返延迟），最后上传 `phigros/current.json`（no-cache）；随后清空桶内 `phigros/releases/` 下所有旧对象，仅保留本次上传。
 
-整个工作流超时上限 6 小时（runner 在海外，跨境下载与上传都偏慢，属正常）；上传中途失败可直接重跑，同 key 覆盖写，无副作用。
+整个工作流超时上限 6 小时（runner 在海外，跨境下载与上传都偏慢，属正常）；上传中途失败不会更新 current.json 或清理旧资源；可重跑，但同版本对象在上传期间可能已部分覆盖，应用会校验并重试。
 
 ## 发布产物结构
 
@@ -59,7 +59,7 @@
 
 ```bash
 python -m pip install -r requirements.txt
-# Linux 需先安装音频库：sudo apt-get install -y libogg0 libvorbis0a
+# Linux 需先安装音频库：sudo apt-get install -y libogg0 libvorbis0a libvorbisenc2
 export S3_BUCKET=... S3_ACCESS_KEY=... S3_SECRET_KEY=...
 python publish.py
 ```
@@ -76,5 +76,19 @@ python publish.py
 ## 致谢与许可
 
 - 解包工具链 [phiTool](https://github.com/Chnynnya/phiTool)（GPL-3.0，见 `bundled/phiTool/script-py/` 文件头）。
-- 音乐重建依赖 [python-fsb5](https://github.com/HearthSim/python-fsb5) 与 Xiph.Org 的 libogg / libvorbis（BSD-3，见 `bundled/phiTool/script-py/LICENSE-xiph.txt`）。
+- 音乐重建依赖 [python-fsb5](https://github.com/HearthSim/python-fsb5) 与 Xiph.Org 的 libogg / libvorbis / libvorbisenc（BSD-3，见 `bundled/phiTool/script-py/LICENSE-xiph.txt`）。
 - 资源解析依赖 [UnityPy](https://github.com/K0lb3/UnityPy)。
+
+## 完整性检查与验证
+
+上传前重新核对全部清单文件的大小及 SHA-256、文件集合、歌曲音乐覆盖和发布指针。
+提取或写盘任务出现异常会使流程失败，错误包含对应文件；不会把空 music 目录判为成功。
+发布汇总包含 songCount、musicCount 和 missingResources；失败详情在日志中列出缺失资源。
+
+```sh
+python -m unittest discover -s tests -v
+python -c "from phigros_publisher.extract_cli import preflight_audio; preflight_audio()"
+```
+
+Windows 音频预检需在 `bundled/phiTool/script-py` 作为工作目录时运行，以便加载随工具链提供的 DLL。
+Linux 校验任务会显式安装 `libogg0`、`libvorbis0a`、`libvorbisenc2`，测试过程不连接 S3。

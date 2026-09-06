@@ -129,6 +129,7 @@ def _write_summary(
         "gameVersion": version,
         "assetCount": release.get("asset_count"),
         "totalBytes": release.get("total_bytes"),
+        **release.get("validation", {}),
         "uploaded": upload.get("uploaded"),
         "deletedPrevious": upload.get("deleted_previous"),
         "currentUrl": upload.get("current_url"),
@@ -156,6 +157,7 @@ def _write_summary(
             sink.write("\n## Phigros 全量发布结果\n\n")
             sink.write("| 项目 | 值 |\n| --- | --- |\n")
             sink.write(f"| 游戏版本 | {version} |\n")
+            sink.write(f"| 歌曲 / 音乐 | {release['validation']['songCount']} / {release['validation']['musicCount']} |\n")
             sink.write(f"| 资产数量 | {release.get('asset_count')} |\n")
             sink.write(f"| 资产总大小 | {_fmt_bytes(release.get('total_bytes') or 0)} |\n")
             sink.write(f"| 上传对象数 | {upload.get('uploaded')} |\n")

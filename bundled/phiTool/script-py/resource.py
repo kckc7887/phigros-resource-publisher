@@ -21,10 +21,8 @@ import gc
 from io import BytesIO
 import json
 import os
-from queue import Queue
 import shutil
 import sys
-import threading
 import time
 from UnityPy import Environment
 from UnityPy.classes import AudioClip
@@ -50,30 +48,48 @@ class ByteReader:
         return self.data[self.position - 4] ^ self.data[self.position - 3] << 8 ^ self.data[self.position - 2] << 16
 
 
-queue_out = Queue()
-queue_in = Queue()
-
-
-def io():
-    while True:
-        item = queue_in.get()
-        if item is None:
-            break
-        else:
-            path, resource = item
-            if type(resource) == BytesIO:
+def write_resource(item):
+    path, resource = item
+    try:
+        with open(path, "wb") as sink:
+            if isinstance(resource, BytesIO):
                 with resource:
-                    with open(path, "wb") as f:
-                        f.write(resource.getbuffer())
+                    sink.write(resource.getbuffer())
             else:
-                with open(path, "wb") as f:
-                    f.write(resource)
+                sink.write(resource)
+    except Exception as error:
+        raise RuntimeError(f"资源写入失败：{path}") from error
+
+
+class CheckedThreadPoolExecutor(ThreadPoolExecutor):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tasks = []
+
+    def submit(self, fn, *args, **kwargs):
+        future = super().submit(fn, *args, **kwargs)
+        self.tasks.append((future, args[0] if args else fn.__name__))
+        return future
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        result = super().__exit__(exc_type, exc_value, traceback)
+        if exc_type is None:
+            failures = []
+            for task, path in self.tasks:
+                try:
+                    task.result()
+                except Exception as error:
+                    failures.append((path, error))
+            if failures:
+                paths = ", ".join(str(path) for path, _ in failures)
+                raise RuntimeError(f"资源提取失败（{len(failures)} 项）：{paths}") from failures[0][1]
+        return result
 
 
 def save_image(path, image):
     bytesIO = BytesIO()
     image.save(bytesIO, "png")
-    queue_in.put((path, bytesIO))
+    write_resource((path, bytesIO))
 
 
 def save_music(path, music: AudioClip):
@@ -81,8 +97,10 @@ def save_music(path, music: AudioClip):
     # 必须在保存音乐时自行加载 fsb5。
     from fsb5 import FSB5
     fsb = FSB5(music.m_AudioData)
-    rebuilt_sample = fsb.rebuild_sample(fsb.samples[0])
-    queue_in.put((path, rebuilt_sample))
+    rebuilt_sample = bytes(fsb.rebuild_sample(fsb.samples[0]))
+    if not rebuilt_sample.startswith(b"OggS"):
+        raise ValueError(f"音乐不是有效 OGG：{path}")
+    write_resource((path, rebuilt_sample))
 
 
 classes = ClassIDType.TextAsset, ClassIDType.Sprite, ClassIDType.AudioClip
@@ -95,18 +113,18 @@ def save(key, entry, pool, logger, output_dirs, config):
         key = key[7:]
         bytesIO = BytesIO()
         obj.image.save(bytesIO, "png")
-        queue_in.put((os.path.join(output_dirs["avatar"], "%s.png" % key), bytesIO))
+        write_resource((os.path.join(output_dirs["avatar"], "%s.png" % key), bytesIO))
     elif config["chart"] and key[-14:-7] == "/Chart_" and key[-5:] == ".json":
         logger.info(key)
         p = os.path.join(output_dirs["chart"], key[:-14])
         if not os.path.exists(p):
             os.mkdir(p)
-        queue_in.put((os.path.join(output_dirs["chart"], "%s/%s.json" % (key[:-14], key[-7:-5])), obj.script))
+        write_resource((os.path.join(output_dirs["chart"], "%s/%s.json" % (key[:-14], key[-7:-5])), obj.script))
     elif config["illustrationBlur"] and key[-23:-3] == ".0/IllustrationBlur.":
         key = key[:-23]
         bytesIO = BytesIO()
         obj.image.save(bytesIO, "png")
-        queue_in.put((os.path.join(output_dirs["illustrationBlur"], "%s.png" % key), bytesIO))
+        write_resource((os.path.join(output_dirs["illustrationBlur"], "%s.png" % key), bytesIO))
     elif config["illustrationLowRes"] and key[-25:-3] == ".0/IllustrationLowRes.":
         key = key[:-25]
         pool.submit(save_image, os.path.join(output_dirs["illustrationLowRes"], "%s.png" % key), obj.image)
@@ -197,11 +215,9 @@ def run(path, config, logger, metadata_dir="info", output_dirs=None):
                 avatar[l[1]] = l[0]
                 line = f.readline()[:-1]
 
-    thread = threading.Thread(target=io)
-    thread.start()
     ti = time.time()
     update = config["UPDATE"]
-    with ThreadPoolExecutor(6) as pool:
+    with CheckedThreadPoolExecutor(6) as pool:
         if update["main_story"] == 0 and update["other_song"] == 0 and update["side_story"] == 0:
             with ZipFile(path) as apk:
                 for key, entry in table:
@@ -234,8 +250,6 @@ def run(path, config, logger, metadata_dir="info", output_dirs=None):
                             break
             for i_key, i_entry in env.files.items():
                 save(i_key, i_entry, pool, logger, output_dirs, config)
-    queue_in.put(None)
-    thread.join()
     logger.info("%f秒" % round(time.time() - ti, 4))
 
 
