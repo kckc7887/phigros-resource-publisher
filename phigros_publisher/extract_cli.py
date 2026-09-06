@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -43,6 +44,8 @@ def _ensure_output_dirs(output_root: Path, config: dict) -> dict[str, Path]:
 
 
 def preflight_audio() -> None:
+    if not shutil.which("ffprobe"):
+        raise RuntimeError("音乐格式校验需要 ffprobe，请安装 FFmpeg 并加入 PATH")
     try:
         from fsb5 import vorbis
         for library, symbol in ((vorbis.ogg, "ogg_stream_init"),

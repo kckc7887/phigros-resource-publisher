@@ -7,6 +7,7 @@ import json
 import mimetypes
 from pathlib import Path
 import shutil
+import subprocess
 import re
 from uuid import uuid4
 from typing import Any, Callable
@@ -76,6 +77,23 @@ def build_catalog(metadata_dir: Path) -> dict[str, Any]:
     return {"schemaVersion": 1, "songCount": len(songs), "songs": songs}
 
 
+def validate_music(path: Path) -> bool:
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name,sample_rate,channels:format=duration",
+        "-of", "json", str(path),
+    ], capture_output=True, text=True, timeout=30, check=False)
+    if result.returncode or result.stderr.strip():
+        return False
+    try:
+        data = json.loads(result.stdout)
+        stream = data["streams"][0]
+        return (stream["codec_name"] == "vorbis" and int(stream["channels"]) > 0
+                and int(stream["sample_rate"]) > 0 and float(data["format"]["duration"]) > 0)
+    except (KeyError, IndexError, ValueError, TypeError):
+        return False
+
+
 def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     missing: list[str] = []
     songs = catalog["songs"]
@@ -89,7 +107,7 @@ def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, An
         else:
             with music.open("rb") as source:
                 header = source.read(64)
-            if not header.startswith(b"OggS") or b"\x01vorbis" not in header:
+            if not header.startswith(b"OggS") or b"\x01vorbis" not in header or not validate_music(music):
                 missing.append(f"music/{song_id}.ogg (invalid OGG/Vorbis)")
         for directory in ("illustrations", "illustrations-blur", "illustrations-lowres"):
             image = root / directory / f"{song_id}.png"

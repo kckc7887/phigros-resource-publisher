@@ -150,6 +150,8 @@ def upload_release(
         raise ValueError(f"上传配置缺少：{', '.join(missing)}")
 
     scope = normalize_upload_scope(config.get("upload_scope"))
+    if scope == "current":
+        raise ValueError("仅更新 current.json 无法确认远端资源完整性，请使用全量上传")
     validate_release(release_result)
     boto3, Config = _load_boto3()
     client = _make_s3_client(boto3, Config, config)

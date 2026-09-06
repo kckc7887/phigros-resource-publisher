@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -11,6 +12,15 @@ from phigros_publisher.uploader import upload_release
 
 
 class ReleaseTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.audio_temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.audio_temp.cleanup)
+        audio_path = Path(cls.audio_temp.name) / 'fixture.ogg'
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+                        '-t', '0.1', '-c:a', 'libvorbis', str(audio_path)], check=True, timeout=30)
+        cls.audio = audio_path.read_bytes()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -29,7 +39,7 @@ class ReleaseTests(unittest.TestCase):
             path = self.extracted / folder
             path.mkdir()
             (path / ('Song.A.ogg' if folder == 'music' else 'Song.A.png')).write_bytes(
-                b'OggS' + bytes(24) + b'\x01vorbis' + bytes(40) if folder == 'music' else b'png')
+                self.audio if folder == 'music' else b'png')
 
     def release(self):
         return organize_release(self.extracted, self.root / 'release', '3.20.0')
@@ -55,6 +65,17 @@ class ReleaseTests(unittest.TestCase):
         (self.extracted / 'chart/Song.A.0/EZ.json').unlink()
         with self.assertRaisesRegex(ValueError, 'EZ.json'):
             self.release()
+
+    def test_header_only_music_cannot_publish(self):
+        (self.extracted / 'music/Song.A.ogg').write_bytes(b'OggS' + bytes(24) + b'\x01vorbis' + bytes(40))
+        with self.assertRaisesRegex(ValueError, 'invalid OGG'):
+            self.release()
+
+    def test_pointer_only_upload_is_blocked_before_s3(self):
+        with patch('phigros_publisher.uploader._load_boto3') as sdk:
+            with self.assertRaisesRegex(ValueError, '全量上传'):
+                upload_release(self.release(), {**self.config(), 'upload_scope': 'current'})
+            sdk.assert_not_called()
 
     def test_corrupt_file_blocked_before_s3(self):
         release = self.release()

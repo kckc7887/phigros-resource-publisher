@@ -82,6 +82,8 @@ python publish.py
 ## 完整性检查与验证
 
 上传前重新核对全部清单文件的大小及 SHA-256、文件集合、歌曲音乐覆盖和发布指针。
+每首音乐通过 ffprobe 检查 Vorbis 音轨、采样率、声道与正时长，只有 OGG 文件头的残缺文件也会失败。
+仅上传 current.json 的调用会被拒绝；推进发布指针必须经过全量资源上传。
 提取或写盘任务出现异常会使流程失败，错误包含对应文件；不会把空 music 目录判为成功。
 发布汇总包含 songCount、musicCount 和 missingResources；失败详情在日志中列出缺失资源。
 
@@ -91,4 +93,5 @@ python -c "from phigros_publisher.extract_cli import preflight_audio; preflight_
 ```
 
 Windows 音频预检需在 `bundled/phiTool/script-py` 作为工作目录时运行，以便加载随工具链提供的 DLL。
-Linux 校验任务会显式安装 `libogg0`、`libvorbis0a`、`libvorbisenc2`，测试过程不连接 S3。
+Linux 校验任务会显式安装 `libogg0`、`libvorbis0a`、`libvorbisenc2` 和 `ffmpeg`，测试过程不连接 S3。
+本地也需安装 FFmpeg，并确保 `ffprobe` 与 `ffmpeg` 在 PATH 中。
