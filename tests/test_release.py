@@ -69,6 +69,8 @@ class ReleaseTests(unittest.TestCase):
     def test_numbered_chart_variants_do_not_count_as_missing_defaults(self):
         (self.extracted / 'metadata/difficulty.tsv').write_text('Song.A\t1\t5\t10\n')
         for variant in range(7):
+            if variant:
+                (self.extracted / f'music/Song.A.{variant}.ogg').write_bytes(self.audio)
             directory = self.extracted / f'chart/Song.A.{variant}'
             directory.mkdir(exist_ok=True)
             for level in ('EZ', 'HD', 'IN'):
@@ -77,6 +79,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(validate_release(release)['missingResources'], [])
         manifest = json.loads((Path(release['version_dir']) / 'manifest.json').read_text())
         self.assertEqual(sum(asset['path'].startswith('charts/') for asset in manifest['assets']), 21)
+
+    def test_variant_requires_its_own_music(self):
+        alternate = self.extracted / 'chart/Song.A.1'
+        alternate.mkdir()
+        (alternate / 'EZ.json').write_text(json.dumps({'judgeLineList': []}))
+        with self.assertRaisesRegex(ValueError, 'music/Song.A.1.ogg'):
+            self.release()
 
     def test_variant_cannot_hide_a_missing_default_difficulty(self):
         (self.extracted / 'metadata/difficulty.tsv').write_text('Song.A\t1\t5\n')
@@ -167,6 +176,18 @@ class ExtractionTests(unittest.TestCase):
         with patch('builtins.open', side_effect=OSError('disk full')):
             with self.assertRaisesRegex(RuntimeError, 'chart.json'):
                 self.resource.write_resource(('chart.json', b'chart'))
+
+    def test_music_variants_keep_distinct_output_names(self):
+        obj = Mock()
+        entry = Mock()
+        entry.get_filtered_objects.side_effect = lambda _: iter([Mock(read=lambda: obj)])
+        pool = Mock()
+        for variant in (0, 1, 6):
+            self.resource.save(f'Random.SobremSilentroom.{variant}/music.wav', entry, pool, Mock(),
+                               {'music': 'music'}, dict(avatar=False, chart=False, illustrationBlur=False,
+                               illustrationLowRes=False, illustration=False, music=True))
+        self.assertEqual([Path(call.args[1]).name for call in pool.submit.call_args_list],
+                         ['Random.SobremSilentroom.ogg', 'Random.SobremSilentroom.1.ogg', 'Random.SobremSilentroom.6.ogg'])
 
 
 if __name__ == '__main__':

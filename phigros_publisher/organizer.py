@@ -94,6 +94,17 @@ def validate_music(path: Path) -> bool:
         return False
 
 
+def _check_music(root: Path, music_id: str, missing: list[str]) -> None:
+    music = root / "music" / f"{music_id}.ogg"
+    if not music.is_file() or music.stat().st_size < 27:
+        missing.append(f"music/{music_id}.ogg")
+        return
+    with music.open("rb") as source:
+        header = source.read(64)
+    if not header.startswith(b"OggS") or b"\x01vorbis" not in header or not validate_music(music):
+        missing.append(f"music/{music_id}.ogg (invalid OGG/Vorbis)")
+
+
 def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, Any]:
     missing: list[str] = []
     songs = catalog["songs"]
@@ -101,14 +112,7 @@ def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, An
         missing.append("catalog songs")
     for song in songs:
         song_id = song["id"]
-        music = root / "music" / f"{song_id}.ogg"
-        if not music.is_file() or music.stat().st_size < 27:
-            missing.append(f"music/{song_id}.ogg")
-        else:
-            with music.open("rb") as source:
-                header = source.read(64)
-            if not header.startswith(b"OggS") or b"\x01vorbis" not in header or not validate_music(music):
-                missing.append(f"music/{song_id}.ogg (invalid OGG/Vorbis)")
+        _check_music(root, song_id, missing)
         for directory in ("illustrations", "illustrations-blur", "illustrations-lowres"):
             image = root / directory / f"{song_id}.png"
             if not image.is_file() or image.stat().st_size == 0:
@@ -121,6 +125,9 @@ def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, An
         primary = next((path for name in (f"{song_id}.0", song_id)
                         for path in chart_dirs if path.name == name),
                        chart_dirs[0] if len(chart_dirs) == 1 else None)
+        for variant in chart_dirs:
+            if variant.name not in (song_id, f"{song_id}.0"):
+                _check_music(root, variant.name, missing)
         for index, constant in enumerate(song["difficulties"]):
             if constant <= 0:
                 continue
