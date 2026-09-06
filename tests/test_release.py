@@ -66,6 +66,35 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'EZ.json'):
             self.release()
 
+    def test_numbered_chart_variants_do_not_count_as_missing_defaults(self):
+        (self.extracted / 'metadata/difficulty.tsv').write_text('Song.A\t1\t5\t10\n')
+        for variant in range(7):
+            directory = self.extracted / f'chart/Song.A.{variant}'
+            directory.mkdir(exist_ok=True)
+            for level in ('EZ', 'HD', 'IN'):
+                (directory / f'{level}.json').write_text(json.dumps({'judgeLineList': []}))
+        release = self.release()
+        self.assertEqual(validate_release(release)['missingResources'], [])
+        manifest = json.loads((Path(release['version_dir']) / 'manifest.json').read_text())
+        self.assertEqual(sum(asset['path'].startswith('charts/') for asset in manifest['assets']), 21)
+
+    def test_variant_cannot_hide_a_missing_default_difficulty(self):
+        (self.extracted / 'metadata/difficulty.tsv').write_text('Song.A\t1\t5\n')
+        alternate = self.extracted / 'chart/Song.A.1'
+        alternate.mkdir()
+        (alternate / 'HD.json').write_text(json.dumps({'judgeLineList': []}))
+        with self.assertRaisesRegex(ValueError, 'HD.json'):
+            self.release()
+
+    def test_multiple_variants_without_a_default_remain_ambiguous(self):
+        default = self.extracted / 'chart/Song.A.0'
+        default.rename(self.extracted / 'chart/Song.A.1')
+        alternate = self.extracted / 'chart/Song.A.2'
+        alternate.mkdir()
+        (alternate / 'EZ.json').write_text(json.dumps({'judgeLineList': []}))
+        with self.assertRaisesRegex(ValueError, 'EZ.json'):
+            self.release()
+
     def test_header_only_music_cannot_publish(self):
         (self.extracted / 'music/Song.A.ogg').write_bytes(b'OggS' + bytes(24) + b'\x01vorbis' + bytes(40))
         with self.assertRaisesRegex(ValueError, 'invalid OGG'):

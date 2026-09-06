@@ -116,11 +116,16 @@ def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, An
         chart_root = root / "charts"
         chart_dirs = [path for path in chart_root.iterdir() if path.is_dir()
                       and re.fullmatch(re.escape(song_id) + r"(?:\.\d+)?", path.name)] if chart_root.is_dir() else []
+        # The published music is extracted from .0/music.wav. Other numbered charts
+        # (e.g. Random's .1-.6) are variants, not duplicate default resources.
+        primary = next((path for name in (f"{song_id}.0", song_id)
+                        for path in chart_dirs if path.name == name),
+                       chart_dirs[0] if len(chart_dirs) == 1 else None)
         for index, constant in enumerate(song["difficulties"]):
             if constant <= 0:
                 continue
             level = ("EZ", "HD", "IN", "AT")[index]
-            files = [path / f"{level}.json" for path in chart_dirs if (path / f"{level}.json").is_file()]
+            files = [primary / f"{level}.json"] if primary and (primary / f"{level}.json").is_file() else []
             if len(files) != 1 or files[0].stat().st_size == 0:
                 missing.append(f"charts/{song_id}/{level}.json")
     report = {"songCount": len(songs), "musicCount": len(list((root / "music").glob("*.ogg"))),
