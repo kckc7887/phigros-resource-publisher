@@ -112,18 +112,17 @@ class CandidatePreparationTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"OggS" + bytes(24) + b"\x01vorbis" if folder == "music" else b"png")
 
-    def test_same_game_version_gets_distinct_immutable_candidate_paths(self):
+    def test_same_game_version_reuses_local_bundle_directory(self):
         with patch("phigros_publisher.organizer.validate_music", return_value=True):
             first = organize_release(self.extracted, self.root / "release", "3.20.0", workers=2)
             first_root = Path(first["version_dir"])
-            original = {path.relative_to(first_root): path.read_bytes() for path in first_root.rglob("*") if path.is_file()}
             (self.extracted / "illustration/Song.A.png").write_bytes(b"new picture")
             second = organize_release(self.extracted, self.root / "release", "3.20.0", workers=2)
             self.assertEqual(validate_release(second, workers=2)["songCount"], 2)
-        self.assertNotEqual(first["version_dir"], second["version_dir"])
+        self.assertEqual(first["version_dir"], second["version_dir"])
         self.assertEqual(first["version"], second["version"])
-        for relative, content in original.items():
-            self.assertEqual((first_root / relative).read_bytes(), content)
+        self.assertEqual(Path(second["version_dir"]).name, "bundle")
+        self.assertEqual((first_root / "illustrations/Song.A.png").read_bytes(), b"new picture")
         for result in (first, second):
             resource_version = Path(result["version_dir"]).name
             self.assertEqual(result["current"]["resourceVersion"], resource_version)

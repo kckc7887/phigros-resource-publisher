@@ -65,7 +65,7 @@ jobs:
           S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
           S3_PUBLIC_BASE: ${{ secrets.S3_PUBLIC_BASE }}
-          # 可选：在 Settings → Variables 里建 S3_UPLOAD_WORKERS 调整并行上传线程数（默认 8）
+          # 可选：在 Settings → Variables 里建 S3_UPLOAD_WORKERS 调整并行上传线程数（默认 4）
           S3_UPLOAD_WORKERS: ${{ vars.S3_UPLOAD_WORKERS }}
           PHIGROS_PARSE_WORKERS: ${{ vars.PHIGROS_PARSE_WORKERS }}
         run: python publish.py

@@ -45,11 +45,13 @@ class ReleaseTests(unittest.TestCase):
     def release(self):
         return organize_release(self.extracted, self.root / 'release', '3.20.0')
 
-    def test_complete_release_and_unique_revision(self):
+    def test_complete_release_reuses_local_bundle_directory(self):
         first = self.release()
         self.assertEqual(validate_release(first), {'songCount': 1, 'musicCount': 1, 'missingResources': []})
         second = self.release()
-        self.assertNotEqual(first['current']['resourceVersion'], second['current']['resourceVersion'])
+        self.assertEqual(first['current']['resourceVersion'], 'bundle')
+        self.assertEqual(second['current']['resourceVersion'], 'bundle')
+        self.assertEqual(first['version_dir'], second['version_dir'])
         self.assertEqual(len(second['current']['manifestSha256']), 64)
 
     def test_empty_music_directory_cannot_publish(self):
@@ -126,7 +128,8 @@ class ReleaseTests(unittest.TestCase):
 
     @staticmethod
     def config():
-        return dict(endpoint='https://example.com', bucket='test', access_key='test', secret_key='test', max_workers=1)
+        return dict(endpoint='https://example.com', bucket='test', access_key='test', secret_key='test', max_workers=1,
+                    release_date='2026-09-14')
 
     def test_upload_failure_does_not_advance_pointer_or_delete(self):
         release = self.release()

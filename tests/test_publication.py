@@ -38,6 +38,7 @@ class FakeS3:
         self.max_active = 0
         self.transfer_configs = []
         self.delay = 0
+        self.copies = []
         self.meta = SimpleNamespace(service_model=SimpleNamespace(operation_model=lambda _: SimpleNamespace(
             input_shape=SimpleNamespace(members={"IfMatch": {}, "IfNoneMatch": {}}))))
 
@@ -120,6 +121,34 @@ class FakeS3:
                 self.on_delete()
         return result
 
+    def copy_object(self, *, Bucket, Key, CopySource, **kwargs):
+        source = CopySource["Key"] if isinstance(CopySource, dict) else str(CopySource).split("/", 1)[-1]
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.operations.append(("copy", source, Key))
+            self.copies.append((source, Key))
+            missing = source not in self.objects
+            data = None if missing else self.objects[source]
+        try:
+            if missing:
+                raise s3_error("NoSuchKey", "CopyObject")
+            if self.delay:
+                time.sleep(self.delay)
+            with self.lock:
+                self.objects[Key] = data
+        finally:
+            with self.lock:
+                self.active -= 1
+        return {}
+
+    def head_object(self, *, Bucket, Key):
+        with self.lock:
+            self.operations.append(("head", Key))
+            if Key not in self.objects:
+                raise s3_error("NoSuchKey", "HeadObject")
+            return {"ContentLength": len(self.objects[Key])}
+
     def delete_object(self, *, Bucket, Key):
         with self.lock:
             self.operations.append(("delete_single", Key))
@@ -157,7 +186,8 @@ class PublicationTests(unittest.TestCase):
         self.s3 = FakeS3()
         self.report = self.root / "report.json"
         self.config = {"endpoint": "https://example.com", "bucket": "test", "access_key": "test",
-                       "secret_key": "test", "max_workers": 4, "report_path": self.report}
+                       "secret_key": "test", "max_workers": 4, "report_path": self.report,
+                       "release_date": "2026-09-14"}
         self.patcher = patch("phigros_publisher.uploader._make_s3_client", return_value=self.s3)
         self.client_factory = self.patcher.start()
         self.addCleanup(self.patcher.stop)
@@ -188,21 +218,28 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(len(self.s3.operations), 2)
         self.assertTrue(all(op[0] == "get" and op[1].endswith(".json") for op in self.s3.operations))
 
-    def test_one_asset_change_uploads_every_asset_and_then_deletes_only_old_snapshot(self):
+    def test_one_asset_change_copies_unchanged_files_and_sweeps_non_current_prefixes(self):
         old = self.old()
-        unrelated = "phigros/releases/unrelated/keep"
-        self.s3.objects[unrelated] = b"keep"
+        leftover = "phigros/releases/unrelated/keep"
+        self.s3.objects[leftover] = b"keep"
         release = self.changed()
         result = self.publish(release)
         uploads = [op for op in self.s3.operations if op[0] == "upload"]
-        self.assertEqual(len(uploads), release["asset_count"])
+        copies = [op for op in self.s3.operations if op[0] == "copy" and op[2].startswith(result["candidate_prefix"])]
+        self.assertEqual(len(uploads), 1)
+        self.assertTrue(uploads[0][1].endswith("illustrations/Song.A.png"))
+        self.assertEqual(len(copies), release["asset_count"] - 1)
+        self.assertEqual(result["candidate_prefix"], "phigros/releases/2026-09-14-2/")
         self.assertNotEqual(result["candidate_prefix"], old["candidate_prefix"])
-        self.assertIn(unrelated, self.s3.objects)
-        self.assertTrue(all(op[1].startswith(old["candidate_prefix"]) for op in self.s3.operations if op[0] == "delete"))
-        last_resource_get = max(i for i, op in enumerate(self.s3.operations) if op[0] == "get" and op[1].startswith(result["candidate_prefix"]))
+        self.assertNotIn(leftover, self.s3.objects)
+        self.assertTrue(all(op[1].startswith("phigros/releases/") and not op[1].startswith(result["candidate_prefix"])
+                            for op in self.s3.operations if op[0] == "delete"))
+        last_resource = max(
+            i for i, op in enumerate(self.s3.operations)
+            if (op[2] if op[0] == "copy" else op[1] if len(op) > 1 else "").startswith(result["candidate_prefix"]))
         pointer_put = self.s3.operations.index(("put", CURRENT_KEY))
         first_delete = next(i for i, op in enumerate(self.s3.operations) if op[0] == "delete")
-        self.assertLess(last_resource_get, pointer_put)
+        self.assertLess(last_resource, pointer_put)
         self.assertLess(pointer_put, first_delete)
 
     def test_unchanged_artifact_current_and_manifest_keep_matching_hashes(self):
@@ -255,8 +292,7 @@ class PublicationTests(unittest.TestCase):
         old = self.old()
         current_bytes = self.s3.objects[CURRENT_KEY]
         release = self.changed()
-        prefix = release["current"]["manifest"].rsplit("/", 1)[0] + "/"
-        self.s3.corrupt.add(prefix + "illustrations/Song.A.png")
+        self.s3.corrupt.add("phigros/releases/2026-09-14-2/illustrations/Song.A.png")
         with self.assertRaisesRegex(ValueError, "SHA-256"):
             self.publish(release)
         self.assertEqual(self.s3.objects[CURRENT_KEY], current_bytes)
@@ -278,7 +314,7 @@ class PublicationTests(unittest.TestCase):
 
     def test_manifest_readback_failure_stops_pointer(self):
         release = self.release()
-        self.s3.corrupt.add(release["current"]["manifest"])
+        self.s3.corrupt.add("phigros/releases/2026-09-14/manifest.json")
         with self.assertRaisesRegex(ValueError, "SHA-256"):
             self.publish(release)
         self.assertNotIn(CURRENT_KEY, self.s3.objects)
@@ -342,14 +378,20 @@ class PublicationTests(unittest.TestCase):
         self.assertLessEqual(self.s3.max_active, 4)
         self.assertTrue(all(not config.use_threads and config.max_concurrency == 1 for config in self.s3.transfer_configs))
 
-    def test_existing_candidate_namespace_is_never_overwritten(self):
-        release = self.release()
-        candidate = release["current"]["manifest"].rsplit("/", 1)[0] + "/existing"
-        self.s3.objects[candidate] = b"keep"
-        with self.assertRaisesRegex(ValueError, "目录已存在"):
-            self.publish(release)
-        self.assertEqual(self.s3.objects[candidate], b"keep")
-        self.assertFalse(any(op[0] in ("upload", "put") for op in self.s3.operations))
+    def test_failed_leftover_date_prefix_is_reused_after_wipe(self):
+        leftover = "phigros/releases/2026-09-14/charts/leftover.json"
+        self.s3.objects[leftover] = b"stale"
+        result = self.publish()
+        self.assertEqual(result["candidate_prefix"], "phigros/releases/2026-09-14/")
+        self.assertNotIn(leftover, self.s3.objects)
+        self.assertTrue(any(key.startswith("phigros/releases/2026-09-14/") for key in self.s3.objects))
+
+    def test_same_day_second_change_uses_date_suffix(self):
+        first = self.old()
+        self.assertEqual(first["candidate_prefix"], "phigros/releases/2026-09-14/")
+        result = self.publish(self.changed())
+        self.assertEqual(result["candidate_prefix"], "phigros/releases/2026-09-14-2/")
+        self.assertFalse(any(key.startswith(first["candidate_prefix"]) for key in self.s3.objects))
 
     def test_unsafe_manifest_path_rejected(self):
         manifest = {"schemaVersion": 1, "gameVersion": "1", "assetCount": 1, "totalBytes": 1,

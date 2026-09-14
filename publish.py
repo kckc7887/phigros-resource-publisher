@@ -1,6 +1,6 @@
 """Phigros 资源全量发布入口（GitHub Actions 用）。
 
-流程：TapTap 下载最新 APK → 并行全量解析 → 比较资源清单 → 变化时完整上传独立修订并校验切换。
+流程：TapTap 下载最新 APK → 并行全量解析 → 比较资源清单 → 变化时按日期目录差量发布并校验切换。
 配置全部来自环境变量（由 GitHub Secrets 注入）。
 
 必填环境变量：
@@ -10,7 +10,7 @@
 可选环境变量：
     S3_ENDPOINT    S3 兼容端点（默认雨云 https://cn-nb1.rains3.com）
     S3_PUBLIC_BASE 公网访问基址（仅用于汇总中的 current_url）
-    S3_UPLOAD_WORKERS 并行上传线程数，1-32（默认 8；跨境传小文件多，串行会被延迟拖垮）
+    S3_UPLOAD_WORKERS 并行上传/复制线程数，1-32（默认 4）
     PHIGROS_PARSE_WORKERS 并行解析线程数，1-16（默认 4）
 """
 
@@ -35,7 +35,7 @@ from phigros_publisher.uploader import upload_release
 DEFAULT_ENDPOINT = "https://cn-nb1.rains3.com"
 REQUIRED_ENV = ("S3_BUCKET", "S3_ACCESS_KEY", "S3_SECRET_KEY")
 
-# 全量解析；资源清单任意变化时全量发布。切换后仅清理切换前捕获的旧目录快照。
+# 全量解析；资源清单变化时按日期目录差量发布。切换后清理非当前 releases 前缀。
 UPLOAD_SCOPE = "all"
 DELETE_PREVIOUS = True
 
@@ -85,7 +85,7 @@ def _load_workers(name: str, default: int, maximum: int) -> int:
 
 
 def _load_upload_workers() -> int:
-    return _load_workers("S3_UPLOAD_WORKERS", 8, 32)
+    return _load_workers("S3_UPLOAD_WORKERS", 4, 32)
 
 
 def _download_progress() -> Callable[[int, int], None]:
@@ -260,7 +260,7 @@ def main() -> None:
     _log("已删除解包中间产物以释放磁盘")
 
     # ---- 阶段 4：全量上传 ----
-    _log(f"开始比较 S3 清单；变化时使用 {upload_workers} 个并行任务完整上传并回读校验")
+    _log(f"开始比较 S3 清单；变化时使用 {upload_workers} 个并行任务差量复制或上传")
     try:
         upload = upload_release(
             release,

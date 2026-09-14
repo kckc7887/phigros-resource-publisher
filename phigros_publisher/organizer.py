@@ -9,7 +9,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import re
-from uuid import uuid4
 from typing import Any, Callable
 
 from .chart_notes import write_note_counts_tsv
@@ -29,6 +28,8 @@ RESOURCE_DIR_MAP = {
 _CONTENT_TYPE_OVERRIDES = {
     ".ogg": "audio/ogg",
 }
+
+LOCAL_RESOURCE_VERSION = "bundle"
 
 
 def _safe_version(value: str) -> str:
@@ -199,9 +200,11 @@ def organize_release(
 ) -> dict[str, Any]:
     checked_workers(workers)
     version = _safe_version(game_version)
-    resource_version = f"{version}-{uuid4().hex}"
+    resource_version = LOCAL_RESOURCE_VERSION
     phigros_root = release_root / "phigros"
     version_dir = phigros_root / "releases" / resource_version
+    if version_dir.exists():
+        shutil.rmtree(version_dir)
     version_dir.mkdir(parents=True, exist_ok=False)
 
     copies: list[tuple[Path, Path]] = []
