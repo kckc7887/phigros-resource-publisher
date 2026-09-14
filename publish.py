@@ -277,10 +277,14 @@ def main() -> None:
     except BaseException:
         report_path = artifacts_dir / "publication.json"
         upload = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {"status": "failed"}
+        _log(
+            f"发布中断：已复制 {upload.get('copied', 0)}/{upload.get('planned_copies', '?')}，"
+            f"已 PUT {upload.get('uploaded', 0)}/{upload.get('planned_uploads', '?')}"
+        )
         _write_summary(artifacts_dir, release, upload, release["version"], time.monotonic() - started)
         raise
     _log(
-        f"上传完成：{upload['uploaded']} 个对象，"
+        f"上传完成：PUT {upload['uploaded']}，复制 {upload.get('copied', 0)}，"
         f"清理旧对象 {upload['deleted_previous']} 个"
     )
 

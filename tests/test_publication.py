@@ -376,7 +376,24 @@ class PublicationTests(unittest.TestCase):
         self.publish()
         self.assertGreater(self.s3.max_active, 1)
         self.assertLessEqual(self.s3.max_active, 4)
-        self.assertTrue(all(not config.use_threads and config.max_concurrency == 1 for config in self.s3.transfer_configs))
+        self.assertTrue(all(
+            not config.use_threads and config.max_concurrency == 1
+            and config.multipart_threshold >= 5 * 1024 ** 3
+            for config in self.s3.transfer_configs))
+
+    def test_date_fields_do_not_block_copy_of_unchanged_files(self):
+        self.old()
+        current = json.loads(self.s3.objects[CURRENT_KEY])
+        current["publishedAt"] = "2000-01-01T00:00:00+00:00"
+        self.s3.objects[CURRENT_KEY] = json.dumps(current).encode()
+        self.s3.operations.clear()
+        result = self.publish(self.changed())
+        copies = [op for op in self.s3.operations if op[0] == "copy"]
+        uploads = [op for op in self.s3.operations if op[0] == "upload"]
+        self.assertGreater(len(copies), 0)
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(result["planned_uploads"], 1)
+        self.assertEqual(result["copied"], result["planned_copies"])
 
     def test_failed_leftover_date_prefix_is_reused_after_wipe(self):
         leftover = "phigros/releases/2026-09-14/charts/leftover.json"

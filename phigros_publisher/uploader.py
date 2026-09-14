@@ -50,7 +50,7 @@ def _make_s3_client(boto3: Any, Config: Any, config: dict[str, Any]) -> Any:
         "s3": {"addressing_style": "path"},
         "retries": {"total_max_attempts": 5, "mode": "standard"},
         "connect_timeout": 15,
-        "read_timeout": 120,
+        "read_timeout": 180,
         "max_pool_connections": max(4, int(config.get("max_workers") or 4)),
     }
     # boto3>=1.36 默认改用 CRC；兼容端常仍强制 DeleteObjects 要 Content-MD5。
@@ -278,16 +278,11 @@ def _baseline(client: Any, bucket: str) -> dict[str, Any]:
         if hashlib.sha256(manifest_bytes).hexdigest() != current.get("manifestSha256"):
             return result
         manifest = json.loads(manifest_bytes)
-        manifest_text = manifest_bytes.decode("utf-8")
-        _manifest_identity(manifest)
-        if (type(current.get("schemaVersion")) is not int or current["schemaVersion"] != 1
-                or manifest["gameVersion"] != current.get("gameVersion")
-                or manifest.get("generatedAt") != current.get("publishedAt")):
-            return result
-    except (ValueError, TypeError, AttributeError, KeyError):
+        result["manifest"] = manifest
+        result["manifest_text"] = manifest_bytes.decode("utf-8")
         return result
-    return {"etag": etag, "current": current, "manifest": manifest, "prefix": prefix,
-            "manifest_text": manifest_text}
+    except (ValueError, TypeError, AttributeError, KeyError, UnicodeError):
+        return result
 
 
 def _snapshot(client: Any, bucket: str, prefix: str) -> list[str]:
@@ -500,7 +495,13 @@ def upload_release(
         previous = _baseline(client, config["bucket"])
         report["baseline_etag"] = previous["etag"]
         report["previous_prefix"] = previous["prefix"]
-        if scope == "all" and previous["manifest"] is not None and identity == _manifest_identity(previous["manifest"]):
+        remote_identity = None
+        if previous["manifest"] is not None:
+            try:
+                remote_identity = _manifest_identity(previous["manifest"])
+            except ValueError:
+                remote_identity = None
+        if scope == "all" and remote_identity is not None and identity == remote_identity:
             report.update(status="unchanged", unchanged=True, active_current=previous["current"],
                           active_manifest_text=previous["manifest_text"],
                           candidate_prefix=previous["prefix"])
@@ -528,7 +529,12 @@ def upload_release(
             raise ValueError("候选发布不得覆盖正在使用的资源目录")
         remote_assets = {}
         if previous.get("manifest") and previous.get("prefix"):
-            remote_assets = {asset["path"]: asset for asset in previous["manifest"]["assets"]}
+            assets = previous["manifest"].get("assets")
+            if isinstance(assets, list):
+                remote_assets = {
+                    asset["path"]: asset for asset in assets
+                    if isinstance(asset, dict) and isinstance(asset.get("path"), str)
+                }
         if scope == "all":
             report["previous_keys"] = [
                 key for key in _snapshot(client, config["bucket"], RELEASES_PREFIX)
@@ -537,19 +543,24 @@ def upload_release(
         report["status"] = "uploading"
         _save_report(report_path, report)
         from boto3.s3.transfer import TransferConfig
-        transfer = TransferConfig(use_threads=False, max_concurrency=1)
+        transfer = TransferConfig(
+            use_threads=False, max_concurrency=1,
+            multipart_threshold=5 * 1024 ** 3, multipart_chunksize=8 * 1024 ** 2)
         asset_map = {asset["path"]: asset for asset in manifest["assets"]}
         selected = [(path, relative) for path, relative in iter_upload_files(version_dir, scope) if relative != "manifest.json"]
         copies, uploads = [], []
         for path, relative in selected:
             asset = asset_map[relative]
             remote = remote_assets.get(relative) if previous.get("prefix") else None
-            if (remote and previous["prefix"] and remote["size"] == asset["size"]
-                    and remote["sha256"] == asset["sha256"]
-                    and remote.get("contentType") == asset["contentType"]):
+            if (remote and previous["prefix"] and remote.get("size") == asset["size"]
+                    and remote.get("sha256") == asset["sha256"]
+                    and (not remote.get("contentType") or remote.get("contentType") == asset["contentType"])):
                 copies.append((previous["prefix"] + relative, prefix + relative, asset["size"]))
             else:
                 uploads.append((path, relative))
+        report["planned_copies"] = len(copies)
+        report["planned_uploads"] = len(uploads)
+        _save_report(report_path, report)
         total = len(copies) + len(uploads) + (2 if scope == "all" else int(scope == "manifest"))
         if not total:
             raise ValueError(f"上传范围 {scope} 没有匹配到任何本地文件")
