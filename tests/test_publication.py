@@ -416,10 +416,11 @@ class PublicationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _manifest_identity(manifest)
 
-    def test_workflow_schedules_beijing_eight_and_keeps_validation_only_push_pr(self):
+    def test_workflow_publishes_only_on_manual_dispatch_and_keeps_validation_only_push_pr(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/publish.yml").read_text(encoding="utf-8")
-        self.assertIn("cron: '0 0 * * *'", workflow)
-        self.assertIn("github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertNotIn("cron:", workflow)
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("PHIGROS_PARSE_WORKERS: ${{ vars.PHIGROS_PARSE_WORKERS }}", workflow)
 

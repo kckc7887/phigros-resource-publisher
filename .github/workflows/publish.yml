@@ -1,12 +1,10 @@
 name: Phigros 全量发布
 
-# 每天北京时间 08:00 检查资源；GitHub schedule 使用 UTC，实际启动可能排队延迟。
+# 实际发布仅手动触发；push / pull request 只跑依赖预检和测试。
 on:
   push:
   pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *'
 
 permissions:
   contents: read
@@ -25,7 +23,7 @@ jobs:
       - run: python -m unittest discover -s tests -v
 
   publish:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    if: github.event_name == 'workflow_dispatch'
     needs: validate
     concurrency:
       group: phigros-publish
