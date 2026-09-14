@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from phigros_publisher.organizer import organize_release, validate_release
 from phigros_publisher.uploader import upload_release
+from test_publication import FakeS3
 
 
 class ReleaseTests(unittest.TestCase):
@@ -129,24 +130,22 @@ class ReleaseTests(unittest.TestCase):
 
     def test_upload_failure_does_not_advance_pointer_or_delete(self):
         release = self.release()
-        client = Mock()
-        client.upload_file.side_effect = RuntimeError('upload failed')
+        client = FakeS3()
+        client.fail_upload = True
         with patch('phigros_publisher.uploader._load_boto3', return_value=(Mock(), Mock())), \
-             patch('phigros_publisher.uploader._make_s3_client', return_value=client), \
-             patch('phigros_publisher.uploader.delete_stale_release_objects') as delete:
+             patch('phigros_publisher.uploader._make_s3_client', return_value=client):
             with self.assertRaisesRegex(RuntimeError, 'upload failed'):
-                upload_release(release, self.config())
-            self.assertFalse(any(call.args[2] == 'phigros/current.json' for call in client.upload_file.call_args_list))
-            delete.assert_not_called()
+                upload_release(release, {**self.config(), 'report_path': self.root / 'report.json'})
+            self.assertNotIn('phigros/current.json', client.objects)
+            self.assertFalse(any(op[0] == 'delete' for op in client.operations))
 
     def test_pointer_is_last_upload(self):
         release = self.release()
-        client = Mock()
+        client = FakeS3()
         with patch('phigros_publisher.uploader._load_boto3', return_value=(Mock(), Mock())), \
-             patch('phigros_publisher.uploader._make_s3_client', return_value=client), \
-             patch('phigros_publisher.uploader.delete_stale_release_objects', return_value=0):
-            upload_release(release, self.config())
-        self.assertEqual(client.upload_file.call_args_list[-1].args[2], 'phigros/current.json')
+             patch('phigros_publisher.uploader._make_s3_client', return_value=client):
+            upload_release(release, {**self.config(), 'report_path': self.root / 'report.json'})
+        self.assertEqual([op[1] for op in client.operations if op[0] in ('upload', 'put')][-1], 'phigros/current.json')
 
     def test_same_size_corruption_rejected(self):
         release = self.release()

@@ -13,6 +13,7 @@ from uuid import uuid4
 from typing import Any, Callable
 
 from .chart_notes import write_note_counts_tsv
+from .parallel import bounded_map, checked_workers
 
 
 RESOURCE_DIR_MAP = {
@@ -105,21 +106,25 @@ def _check_music(root: Path, music_id: str, missing: list[str]) -> None:
         missing.append(f"music/{music_id}.ogg (invalid OGG/Vorbis)")
 
 
-def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, Any]:
+def validate_catalog_assets(root: Path, catalog: dict[str, Any], workers: int = 4) -> dict[str, Any]:
     missing: list[str] = []
+    music_ids: list[str] = []
     songs = catalog["songs"]
     if not songs or catalog["songCount"] != len(songs):
         missing.append("catalog songs")
     for song in songs:
         song_id = song["id"]
-        _check_music(root, song_id, missing)
+        music_ids.append(song_id)
         for directory in ("illustrations", "illustrations-blur", "illustrations-lowres"):
             image = root / directory / f"{song_id}.png"
             if not image.is_file() or image.stat().st_size == 0:
                 missing.append(f"{directory}/{song_id}.png")
         chart_root = root / "charts"
-        chart_dirs = [path for path in chart_root.iterdir() if path.is_dir()
-                      and re.fullmatch(re.escape(song_id) + r"(?:\.\d+)?", path.name)] if chart_root.is_dir() else []
+        chart_dirs = sorted(
+            (path for path in chart_root.iterdir() if path.is_dir()
+             and re.fullmatch(re.escape(song_id) + r"(?:\.\d+)?", path.name)),
+            key=lambda path: path.name,
+        ) if chart_root.is_dir() else []
         # The published music is extracted from .0/music.wav. Other numbered charts
         # (e.g. Random's .1-.6) are variants, not duplicate default resources.
         primary = next((path for name in (f"{song_id}.0", song_id)
@@ -127,7 +132,7 @@ def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, An
                        chart_dirs[0] if len(chart_dirs) == 1 else None)
         for variant in chart_dirs:
             if variant.name not in (song_id, f"{song_id}.0"):
-                _check_music(root, variant.name, missing)
+                music_ids.append(variant.name)
         for index, constant in enumerate(song["difficulties"]):
             if constant <= 0:
                 continue
@@ -135,6 +140,14 @@ def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, An
             files = [primary / f"{level}.json"] if primary and (primary / f"{level}.json").is_file() else []
             if len(files) != 1 or files[0].stat().st_size == 0:
                 missing.append(f"charts/{song_id}/{level}.json")
+
+    def check_music(music_id: str) -> list[str]:
+        failures: list[str] = []
+        _check_music(root, music_id, failures)
+        return failures
+
+    for failures in bounded_map(check_music, dict.fromkeys(music_ids), workers):
+        missing.extend(failures)
     report = {"songCount": len(songs), "musicCount": len(list((root / "music").glob("*.ogg"))),
               "missingResources": missing}
     if missing:
@@ -142,16 +155,21 @@ def validate_catalog_assets(root: Path, catalog: dict[str, Any]) -> dict[str, An
     return report
 
 
-def validate_release(release: dict[str, Any]) -> dict[str, Any]:
+def validate_release(release: dict[str, Any], workers: int = 4) -> dict[str, Any]:
     root = Path(release["version_dir"]).resolve()
     catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
-    report = validate_catalog_assets(root, catalog)
+    report = validate_catalog_assets(root, catalog, workers=workers)
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     current = json.loads(Path(release["current_path"]).read_text(encoding="utf-8"))
     if (current.get("manifestSha256") != _sha256(manifest_path)
             or manifest["gameVersion"] != current["gameVersion"]
-            or manifest["generatedAt"] != current["publishedAt"]):
+            or manifest["generatedAt"] != current["publishedAt"]
+            or manifest.get("resourceVersion") != current.get("resourceVersion")
+            or current.get("resourceVersion") != root.name
+            or current.get("manifest") != f"phigros/releases/{root.name}/manifest.json"
+            or current.get("catalog") != f"phigros/releases/{root.name}/catalog.json"
+            or current.get("noteCounts") != f"phigros/releases/{root.name}/metadata/note_counts.tsv"):
         raise ValueError("发布清单与 current.json 不一致")
     listed = set()
     for asset in manifest["assets"]:
@@ -159,8 +177,13 @@ def validate_release(release: dict[str, Any]) -> dict[str, Any]:
         if not target.is_relative_to(root) or asset["path"] in listed:
             raise ValueError("发布清单路径重复或越界")
         listed.add(asset["path"])
+
+    def verify_asset(asset: dict[str, Any]) -> None:
+        target = root / asset["path"]
         if not target.is_file() or target.stat().st_size != asset["size"] or _sha256(target) != asset["sha256"]:
             raise ValueError(f"发布资源校验失败：{asset['path']}")
+
+    bounded_map(verify_asset, manifest["assets"], workers)
     actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name != "manifest.json"}
     if listed != actual or manifest["assetCount"] != len(listed):
         raise ValueError("发布清单文件集合不完整")
@@ -172,57 +195,77 @@ def organize_release(
     release_root: Path,
     game_version: str,
     progress: Callable[[int, int, str], None] | None = None,
+    workers: int = 4,
 ) -> dict[str, Any]:
+    checked_workers(workers)
     version = _safe_version(game_version)
+    resource_version = f"{version}-{uuid4().hex}"
     phigros_root = release_root / "phigros"
-    version_dir = phigros_root / "releases" / version
-    if version_dir.exists():
-        shutil.rmtree(version_dir)
-    version_dir.mkdir(parents=True, exist_ok=True)
+    version_dir = phigros_root / "releases" / resource_version
+    version_dir.mkdir(parents=True, exist_ok=False)
 
+    copies: list[tuple[Path, Path]] = []
     for source_name, target_name in RESOURCE_DIR_MAP.items():
         source = extracted_output / source_name
-        if source.exists():
-            shutil.copytree(source, version_dir / target_name, dirs_exist_ok=True)
+        if not source.is_dir():
+            continue
+        (version_dir / target_name).mkdir(parents=True, exist_ok=True)
+        for path in sorted(source.rglob("*"), key=lambda path: path.relative_to(source).as_posix()):
+            target = version_dir / target_name / path.relative_to(source)
+            if path.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif path.is_file():
+                copies.append((path, target))
+
+    def copy_asset(paths: tuple[Path, Path]) -> None:
+        source, target = paths
+        shutil.copy2(source, target)
+
+    bounded_map(copy_asset, copies, workers)
 
     metadata_dir = version_dir / "metadata"
     catalog_path = version_dir / "catalog.json"
+    catalog = build_catalog(metadata_dir)
     catalog_path.write_text(
-        json.dumps(build_catalog(metadata_dir), ensure_ascii=False, separators=(",", ":")),
+        json.dumps(catalog, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
 
-    validation = validate_catalog_assets(version_dir, build_catalog(metadata_dir))
+    validation = validate_catalog_assets(version_dir, catalog, workers=workers)
 
     charts_dir = version_dir / "charts"
     note_counts = write_note_counts_tsv(
         charts_dir,
         metadata_dir / "note_counts.tsv",
         metadata_dir,
+        workers=workers,
     )
 
     files = sorted(
-        path for path in version_dir.rglob("*") if path.is_file() and path.name != "manifest.json"
+        (path for path in version_dir.rglob("*") if path.is_file() and path.name != "manifest.json"),
+        key=lambda path: path.relative_to(version_dir).as_posix(),
     )
-    assets: list[dict[str, Any]] = []
     total = len(files)
-    for index, path in enumerate(files, start=1):
+
+    def describe_asset(path: Path) -> dict[str, Any]:
         relative = path.relative_to(version_dir).as_posix()
-        assets.append(
-            {
-                "path": relative,
-                "size": path.stat().st_size,
-                "sha256": _sha256(path),
-                "contentType": _content_type(path),
-            }
-        )
+        return {
+            "path": relative,
+            "size": path.stat().st_size,
+            "sha256": _sha256(path),
+            "contentType": _content_type(path),
+        }
+
+    assets = bounded_map(describe_asset, files, workers)
+    for index, asset in enumerate(assets, start=1):
         if progress:
-            progress(index, total, relative)
+            progress(index, total, asset["path"])
 
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     manifest = {
         "schemaVersion": 1,
         "gameVersion": version,
+        "resourceVersion": resource_version,
         "generatedAt": generated_at,
         "assetCount": len(assets),
         "totalBytes": sum(item["size"] for item in assets),
@@ -237,12 +280,12 @@ def organize_release(
     current = {
         "schemaVersion": 1,
         "gameVersion": version,
-        "resourceVersion": f"{version}-{uuid4().hex}",
+        "resourceVersion": resource_version,
         "manifestSha256": _sha256(manifest_path),
         "publishedAt": generated_at,
-        "manifest": f"phigros/releases/{version}/manifest.json",
-        "catalog": f"phigros/releases/{version}/catalog.json",
-        "noteCounts": f"phigros/releases/{version}/metadata/note_counts.tsv",
+        "manifest": f"phigros/releases/{resource_version}/manifest.json",
+        "catalog": f"phigros/releases/{resource_version}/catalog.json",
+        "noteCounts": f"phigros/releases/{resource_version}/metadata/note_counts.tsv",
     }
     current_path = phigros_root / "current.json"
     current_path.write_text(

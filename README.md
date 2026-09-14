@@ -1,101 +1,75 @@
-# Phigros 全量发布（GitHub Actions 版）
+# Phigros 资源发布
 
-发布工作流仅在手动触发时上传资源；push / pull request 只执行 Linux 依赖预检和测试。手动发布：填好密钥 → 手动 Run → 自动完成 **下载最新 APK → 全量解包（含全曲音乐）→ 全量上传**。音乐等大文件一律提取、一律上传，不做任何裁剪。
+每天北京时间 **08:00**（GitHub cron `0 0 * * *`，UTC）和手动运行时检查资源。GitHub 的定时任务可能排队延迟；push / pull request 只运行依赖预检和测试。Phigros 与 Rizline 位于不同仓库，可以同时运行；本仓库发布使用固定并发组，不取消正在上传的任务。
 
-## 需要配置的 Secrets
+发布流程为 **下载最新 APK → 并行完整解析 → 比较 SHA-256 资源清单 → 有变化时完整发布 → 校验并切换 → 精准清理旧发布**。
 
-在仓库 **Settings → Secrets and variables → Actions → Secrets** 中配置：
+## 配置
 
-| Secret | 必填 | 默认值 | 说明 |
+在 GitHub Actions Secrets 中配置：
+
+| 名称 | 必填 | 说明 |
+| --- | --- | --- |
+| `S3_BUCKET` | 是 | 桶名 |
+| `S3_ACCESS_KEY` | 是 | Access Key |
+| `S3_SECRET_KEY` | 是 | Secret Key |
+| `S3_ENDPOINT` | 否 | 默认 `https://cn-nb1.rains3.com` |
+| `S3_PUBLIC_BASE` | 否 | 公网基址，仅用于汇总链接 |
+
+可选 Actions Variables：
+
+| 名称 | 默认 | 范围 | 作用 |
 | --- | --- | --- | --- |
-| `S3_BUCKET` | 是 | — | 对象存储桶名 |
-| `S3_ACCESS_KEY` | 是 | — | Access Key |
-| `S3_SECRET_KEY` | 是 | — | Secret Key |
-| `S3_ENDPOINT` | 否 | `https://cn-nb1.rains3.com` | S3 兼容端点（雨云等） |
-| `S3_PUBLIC_BASE` | 否 | 空 | 公网访问基址，仅用于汇总中的 `current.json` 直链 |
+| `PHIGROS_PARSE_WORKERS` | 4 | 1–16 | 资源解包、物量统计、文件整理、SHA-256 和音乐校验的有界并发 |
+| `S3_UPLOAD_WORKERS` | 8 | 1–32 | 上传及远端回读校验的有界并发 |
 
-密钥只经 Secrets 注入环境变量，不写入日志与文件。
+凭据只经环境变量提供。需要 GetObject、PutObject、ListBucket 和 DeleteObject 权限；发布指针还要求端点正确支持 `If-Match` / `If-None-Match` 条件写入。SDK 缺少条件参数时在上传资源前退出；端点拒绝条件写入时发布失败，绝不回退到无条件覆盖。
 
-另有一个可选 Variable（**Settings → Secrets and variables → Actions → Variables**）：`S3_UPLOAD_WORKERS`，并行上传线程数（1-32，默认 8）。GitHub runner 在海外、对象存储多在国内，跨境传两千多个小文件时串行会被往返延迟拖垮，因此并行上传默认开启；嫌占带宽可调小，追求更快可调大（如 16）。
+每次需要发布时，先在 `phigros/publisher-checks/<随机键>` 用少量测试字节验证条件写入：错误 ETag 和对已有键的首次写入条件必须拒绝，正确 ETag 必须成功；每次回读检查内容，最后只清理该测试键。端点静默忽略条件头同样会被拒绝。资源完全相同时跳过测试写入。
 
-## 使用方法
+## 资源清单与发布行为
 
-1. 把本仓库推到 GitHub（或直接在本仓库操作）。
-2. 按上表配置 Secrets。
-3. 进入 **Actions** → **Phigros 全量发布** → **Run workflow** → 手动运行。
-4. 运行结束后：
-   - 日志中可看到下载进度、解包（含音乐提取）、逐批上传进度；
-   - Summary 页有发布结果表（版本、资产数、总大小、上传/清理对象数、耗时）；
-   - Artifact `phigros-release-manifests` 归档了 `current.json` / `manifest.json` / `catalog.json` / `note_counts.tsv` / `summary.json`。
+复用已有 `manifest.json`，不增加第二套资源清单。每个资源条目包含相对路径、大小、SHA-256、Content-Type；`current.json` 记录清单自身的 SHA-256。
 
-## 工作流做了什么
+先读取 S3 `phigros/current.json` 及其清单。比较排序后的资源路径、大小、SHA-256、Content-Type 和游戏版本；生成时间、随机修订号不参与资源等同性比较。完全一致时只读取这两份 JSON，跳过资源上传、资源回读、指针更新及清理。清单缺失、损坏、无法验证，或任一资源变化时，**完整上传全部本地资源**。403、网络失败等访问错误会使任务失败，不当作“清单不存在”。
 
-1. **下载**：通过 TapTap 接口查询最新 Phigros 版本，校验下载地址（HTTP 200）后流式下载 APK。
-2. **全量解包**：内置 phiTool 工具链解出头像、全谱面、曲绘（原图 / 模糊 / 低清）、**全曲 `.ogg` 音乐**、元数据，并统计全曲物量表；音乐重建依赖系统 `libogg` / `libvorbis`（工作流自动 apt 安装）。
-3. **整理**：生成发布目录与 `manifest.json`（逐文件 SHA-256）、`catalog.json`、`note_counts.tsv`、`current.json`（包含独立资源修订号与 `manifestSha256`）。
-4. **全量上传**：把 `phigros/releases/<版本>/` 全部资产**多线程并行**上传到对象存储（跨境小文件多，并行掩盖往返延迟），最后上传 `phigros/current.json`（no-cache）；随后清空桶内 `phigros/releases/` 下所有旧对象，仅保留本次上传。
+每轮解析都生成全新的 `phigros/releases/<游戏版本>-<独立修订号>/`。即使游戏版本相同，也不会覆盖正在使用的资源目录；候选前缀已存在时拒绝使用。完整解析保留头像、全谱面、曲绘原图/模糊/低清、所有音乐和元数据。
 
-整个工作流超时上限 6 小时（runner 在海外，跨境下载与上传都偏慢，属正常）；上传中途失败不会更新 current.json 或清理旧资源；可重跑，但同版本对象在上传期间可能已部分覆盖，应用会校验并重试。
+所有资源并行上传后逐个从 S3 流式回读，核对实际字节数和 SHA-256；仅凭 ETag 或自填 metadata 不算校验通过。全部成功后上传并验证 manifest，最后使用开始时捕获的 ETag 条件更新 current（首次发布使用 `If-None-Match: *`），随后回读确认。资源或 manifest 阶段失败时不改指针；条件冲突不会覆盖其它发布。current 写入或回读失败时停止清理，指针可能已经更新，报告会记录 `commit_attempted` 和 `pointer_verified`，不会自动回滚；候选目录保留用于诊断。
 
-## 发布产物结构
+切换确认后，立即删除**本轮开始时捕获的旧 current 所指目录中的对象快照**，每批删除前和结束后再次检查 current。不会扫描并删除全部 `releases/`，不会删除其它游戏、其它候选、历史无关目录或上传后新出现的对象。删除响应中的逐对象失败会保存在报告中，任务失败；不回滚已确认成功的新指针。
 
-```text
-<桶>/
-└── phigros/
-    ├── current.json
-    └── releases/<游戏版本>/
-        ├── manifest.json
-        ├── catalog.json
-        ├── avatars/
-        ├── charts/<歌曲ID>/{EZ,HD,IN,AT}.json
-        ├── illustrations/
-        ├── illustrations-blur/
-        ├── illustrations-lowres/
-        ├── music/<歌曲ID>.ogg
-        └── metadata/{difficulty,info,note_counts}.tsv
-```
+上传只使用一层并发，关闭 boto3 分片传输内层线程，排队任务不超过并发数的两倍；连接超时 15 秒、读超时 120 秒、每次 SDK 操作最多 5 次尝试。并行任务会传播错误；无未验证的半成品发布到 current。
 
-## 本地运行
+上传期间旧目录和 current 完整保留。切换后立即清理意味着仍持有旧 URL 的客户端必须通过 current 刷新并恢复；离线下载到本地的文件不受影响。客户端必须按 current 中的资源目录加载资源，不能自行用 gameVersion 拼接发布路径。对象存储兼容性、真实吞吐和旧 URL 的客户端恢复仍需上线验收，自动测试不代表实际雨云端点已验证。
 
-```bash
-python -m pip install -r requirements.txt
-# Linux 需先安装音频库：sudo apt-get install -y libogg0 libvorbis0a libvorbisenc2
-export S3_BUCKET=... S3_ACCESS_KEY=... S3_SECRET_KEY=...
-python publish.py
-```
+## 产物与失败恢复
 
-本地产物写入 `work/`（已 gitignore），每次运行只保留最新一份。
+Actions 的 `phigros-release-manifests` artifact（始终归档，保留 30 天）包含 `current.json`、`manifest.json`、`catalog.json`、`note_counts.tsv`、`summary.json`、`publication.json` 和 `run-status.json`。没有变化时 current 和 manifest 保存相互匹配的线上内容，`candidate-current.json` / `candidate-manifest.json` 保存未发布的候选；catalog 和物量表来自内容相同的本地解析。每次运行保存在 `work/artifacts/<UTC时间-运行号>/`，后续运行保留已有失败报告。上传失败仍保留报告和可生成的汇总。
 
-## 已知边界
-
-- TapTap 下载接口不承诺长期稳定；接口变动时下载阶段会失败并红脸退出。
-- 音乐重建在 Linux 依赖 `libogg` / `libvorbis`（fsb5 官方支持路径，工作流已自动安装）；`bundled/` 内的 Windows DLL 仅用于本地 Windows 复用。
-- 上传走 S3 兼容接口（boto3，已适配雨云的 path 寻址与 DeleteObjects Content-MD5 要求）。
-- 全量上传会删除桶内 `phigros/releases/` 下所有旧对象，仅保留本次版本。
-
-## 致谢与许可
-
-- 解包工具链 [phiTool](https://github.com/Chnynnya/phiTool)（GPL-3.0，见 `bundled/phiTool/script-py/` 文件头）。
-- 音乐重建依赖 [python-fsb5](https://github.com/HearthSim/python-fsb5) 与 Xiph.Org 的 libogg / libvorbis / libvorbisenc（BSD-3，见 `bundled/phiTool/script-py/LICENSE-xiph.txt`）。
-- 资源解析依赖 [UnityPy](https://github.com/K0lb3/UnityPy)。
-
-## 完整性检查与验证
-
-上传前重新核对全部清单文件的大小及 SHA-256、文件集合、歌曲音乐覆盖和发布指针。
-谱面目录优先使用与发布音乐一致的 `<songId>.0`，其次兼容 `<songId>` 和唯一的编号目录。
-Random 等歌曲的其它编号变体保留在清单中，不视为默认谱面重复；变体不能掩盖默认目录缺少有效难度的问题。
-默认 `.0/music.wav` 导出为 `music/<songId>.ogg`，其它编号导出为 `music/<songId>.<编号>.ogg`。
-每个非默认谱面目录都必须有同编号的有效音乐；musicCount 包含这些变体音频，可大于 songCount。
-每首音乐通过 ffprobe 检查 Vorbis 音轨、采样率、声道与正时长，只有 OGG 文件头的残缺文件也会失败。
-仅上传 current.json 的调用会被拒绝；推进发布指针必须经过全量资源上传。
-提取或写盘任务出现异常会使流程失败，错误包含对应文件；不会把空 music 目录判为成功。
-发布汇总包含 songCount、musicCount 和 missingResources；失败详情在日志中列出缺失资源。
+`publication.json` 记录候选前缀、旧对象快照、提交与回读状态、上传/验证数、已删除数和 `cleanup_remaining`。只有已确认指针切换成功的报告可以自动重试清理。在下载该 artifact 并配置相同 S3 环境变量后运行：
 
 ```sh
+python -m phigros_publisher.uploader --retry-cleanup /path/to/publication.json
+```
+
+重试只删除原始快照中尚未确认成功的键，不重新上传资源、不改指针、不扩大扫描范围。报告与桶/端点不匹配、current 已变化或报告路径越界时拒绝清理。不要手动扩大报告的对象列表。
+
+## 本地运行与验证
+
+```sh
+python -m pip install -r requirements.txt
+# Linux 音频依赖：sudo apt-get install -y libogg0 libvorbis0a libvorbisenc2 ffmpeg
+# 配置 S3_BUCKET、S3_ACCESS_KEY、S3_SECRET_KEY 等环境变量后：
+python publish.py
 python -m unittest discover -s tests -v
 python -c "from phigros_publisher.extract_cli import preflight_audio; preflight_audio()"
 ```
 
-Windows 音频预检需在 `bundled/phiTool/script-py` 作为工作目录时运行，以便加载随工具链提供的 DLL。
-Linux 校验任务会显式安装 `libogg0`、`libvorbis0a`、`libvorbisenc2` 和 `ffmpeg`，测试过程不连接 S3。
-本地也需安装 FFmpeg，并确保 `ffprobe` 与 `ffmpeg` 在 PATH 中。
+本地产物保存在已忽略的 `work/`，不提交资源、APK 或凭据。Windows 音频预检需要在 `bundled/phiTool/script-py` 作为当前目录，以加载随工具链提供的 DLL；FFmpeg / ffprobe 需要在 PATH 中。
+
+发布前校验本地文件集合、大小、SHA-256、歌曲音乐覆盖、谱面难度和发布指针。音乐经 ffprobe 检查 Vorbis 音轨、采样率、声道及正时长；默认 `.0/music.wav` 导出为 `<songId>.ogg`，其它编号变体有各自音乐，不能掩盖默认谱面缺失。测试覆盖清单无变化/缺失/损坏、全量更新、条件冲突、远端损坏、并发上限、准确清理与失败重试，不连接真实 S3。
+
+## 致谢与许可
+
+解包工具链 [phiTool](https://github.com/Chnynnya/phiTool) 使用 GPL-3.0；音乐重建依赖 [python-fsb5](https://github.com/HearthSim/python-fsb5) 和 Xiph.Org libogg / libvorbis / libvorbisenc；Unity 资源解析依赖 [UnityPy](https://github.com/K0lb3/UnityPy)。许可文件保留在 `bundled/phiTool/script-py/`。

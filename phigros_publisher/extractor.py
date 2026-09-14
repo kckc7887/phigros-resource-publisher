@@ -5,9 +5,11 @@ import os
 from pathlib import Path
 import shutil
 import sys
+from threading import RLock
 from typing import Callable
 
 from .extract_cli import run_extract
+from .parallel import checked_workers
 from .toolchain import prepare_toolchain
 
 
@@ -65,22 +67,25 @@ class _LineLogWriter:
         self.buffer = _BinaryLogBuffer(self)
         self.name = "<phigros-publisher-log>"
         self.closed = False
+        self._lock = RLock()
 
     def write(self, data: str) -> int:
         if not data:
             return 0
-        self._buf += data
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            message = line.rstrip("\r")
-            if message and self._log:
-                self._log(message)
+        with self._lock:
+            self._buf += data
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                message = line.rstrip("\r")
+                if message and self._log:
+                    self._log(message)
         return len(data)
 
     def flush(self) -> None:
-        if self._buf and self._log:
-            self._log(self._buf.rstrip("\r"))
-            self._buf = ""
+        with self._lock:
+            if self._buf and self._log:
+                self._log(self._buf.rstrip("\r"))
+                self._buf = ""
 
     def isatty(self) -> bool:
         return False
@@ -110,7 +115,9 @@ def extract_resources(
     toolchain_dir: Path,
     log: Callable[[str], None] | None = None,
     music: bool = False,
+    workers: int = 4,
 ) -> Path:
+    checked_workers(workers)
     phi_tool = prepare_toolchain(demo_root, toolchain_dir)
     output = phi_tool / "output"
     if output.exists():
@@ -130,7 +137,7 @@ def extract_resources(
     previous_path = list(sys.path)
     try:
         with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-            run_extract(script_dir, apk, music=music)
+            run_extract(script_dir, apk, music=music, workers=workers)
     finally:
         writer.flush()
         try:

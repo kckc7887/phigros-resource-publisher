@@ -25,6 +25,7 @@ import re
 import shutil
 import sys
 import time
+from threading import BoundedSemaphore, Lock
 from UnityPy import Environment
 from UnityPy.classes import AudioClip
 from UnityPy.enums import ClassIDType
@@ -65,26 +66,54 @@ def write_resource(item):
 class CheckedThreadPoolExecutor(ThreadPoolExecutor):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.tasks = []
+        self._slots = BoundedSemaphore(self._max_workers * 2)
+        self._task_lock = Lock()
+        self._pending = set()
+        self._failure = None
+
+    def _raise_failure(self):
+        if self._failure is not None:
+            path, error = self._failure
+            raise RuntimeError(f"资源提取失败：{path}") from error
 
     def submit(self, fn, *args, **kwargs):
-        future = super().submit(fn, *args, **kwargs)
-        self.tasks.append((future, args[0] if args else fn.__name__))
+        self._slots.acquire()
+        try:
+            with self._task_lock:
+                self._raise_failure()
+                future = super().submit(fn, *args, **kwargs)
+                self._pending.add(future)
+        except BaseException:
+            self._slots.release()
+            raise
+
+        def completed(task):
+            failed = not task.cancelled() and task.exception() is not None
+            with self._task_lock:
+                self._pending.discard(task)
+                if failed and self._failure is None:
+                    self._failure = (args[0] if args else fn.__name__, task.exception())
+                cancel = list(self._pending) if failed else []
+            self._slots.release()
+            for queued in cancel:
+                queued.cancel()
+
+        future.add_done_callback(completed)
         return future
 
     def __exit__(self, exc_type, exc_value, traceback):
-        result = super().__exit__(exc_type, exc_value, traceback)
+        self.shutdown(wait=True, cancel_futures=exc_type is not None or self._failure is not None)
         if exc_type is None:
-            failures = []
-            for task, path in self.tasks:
-                try:
-                    task.result()
-                except Exception as error:
-                    failures.append((path, error))
-            if failures:
-                paths = ", ".join(str(path) for path, _ in failures)
-                raise RuntimeError(f"资源提取失败（{len(failures)} 项）：{paths}") from failures[0][1]
-        return result
+            self._raise_failure()
+        return False
+
+
+class _BundleWriter:
+    """Save within the parser worker so its Unity objects stay worker-local."""
+
+    @staticmethod
+    def submit(function, *args):
+        return function(*args)
 
 
 def save_image(path, image):
@@ -112,20 +141,15 @@ def save(key, entry, pool, logger, output_dirs, config):
     obj = next(obj).read()
     if config["avatar"] and key[:7] == "avatar.":
         key = key[7:]
-        bytesIO = BytesIO()
-        obj.image.save(bytesIO, "png")
-        write_resource((os.path.join(output_dirs["avatar"], "%s.png" % key), bytesIO))
+        pool.submit(save_image, os.path.join(output_dirs["avatar"], "%s.png" % key), obj.image)
     elif config["chart"] and key[-14:-7] == "/Chart_" and key[-5:] == ".json":
         logger.info(key)
         p = os.path.join(output_dirs["chart"], key[:-14])
-        if not os.path.exists(p):
-            os.mkdir(p)
-        write_resource((os.path.join(output_dirs["chart"], "%s/%s.json" % (key[:-14], key[-7:-5])), obj.script))
+        os.makedirs(p, exist_ok=True)
+        pool.submit(write_resource, (os.path.join(output_dirs["chart"], "%s/%s.json" % (key[:-14], key[-7:-5])), obj.script))
     elif config["illustrationBlur"] and key[-23:-3] == ".0/IllustrationBlur.":
         key = key[:-23]
-        bytesIO = BytesIO()
-        obj.image.save(bytesIO, "png")
-        write_resource((os.path.join(output_dirs["illustrationBlur"], "%s.png" % key), bytesIO))
+        pool.submit(save_image, os.path.join(output_dirs["illustrationBlur"], "%s.png" % key), obj.image)
     elif config["illustrationLowRes"] and key[-25:-3] == ".0/IllustrationLowRes.":
         key = key[:-25]
         pool.submit(save_image, os.path.join(output_dirs["illustrationLowRes"], "%s.png" % key), obj.image)
@@ -140,7 +164,23 @@ def save(key, entry, pool, logger, output_dirs, config):
         # save_music(f"music/{key}.wav", obj)
 
 
-def run(path, config, logger, metadata_dir="info", output_dirs=None):
+def _extract_bundle(item, path, logger, output_dirs, config):
+    key, entry = item
+    # Neither ZipFile nor lazy Unity objects cross worker boundaries. Keeping the
+    # environment alive through saving also bounds decoded image/audio memory.
+    with ZipFile(path) as apk:
+        payload = apk.read("assets/aa/Android/%s" % entry)
+    with BytesIO(payload) as bundle:
+        env = Environment()
+        env.load_file(bundle, name=key)
+        writer = _BundleWriter()
+        for i_key, i_entry in sorted(env.files.items()):
+            save(i_key, i_entry, writer, logger, output_dirs, config)
+
+
+def run(path, config, logger, metadata_dir="info", output_dirs=None, workers=4):
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 16:
+        raise ValueError("资源处理线程数必须为 1-16 的整数")
     if output_dirs is None:
         output_dirs = {
             "avatar": "avatar",
@@ -220,39 +260,24 @@ def run(path, config, logger, metadata_dir="info", output_dirs=None):
 
     ti = time.time()
     update = config["UPDATE"]
-    with CheckedThreadPoolExecutor(6) as pool:
-        if update["main_story"] == 0 and update["other_song"] == 0 and update["side_story"] == 0:
-            with ZipFile(path) as apk:
-                for key, entry in table:
-                    env = Environment()
-                    env.load_file(BytesIO(apk.read("assets/aa/Android/%s" % entry)), name=key)
-                    for i_key, i_entry in env.files.items():
-                        save(i_key, i_entry, pool, logger, output_dirs, config)
-        else:
-            l = []
-            with open(os.path.join(metadata_dir, "difficulty.tsv"), encoding="utf8") as f:
+    if update["main_story"] != 0 or update["other_song"] != 0 or update["side_story"] != 0:
+        l = []
+        with open(os.path.join(metadata_dir, "difficulty.tsv"), encoding="utf8") as f:
+            line = f.readline()
+            while line:
+                l.append(line.split("\t", 2)[0])
                 line = f.readline()
-                while line:
-                    l.append(line.split("\t", 2)[0])
-                    line = f.readline()
-            index1 = l.index("Doppelganger.LeaF")
-            index2 = l.index("Poseidon.1112vsStar")
-            del l[index2:len(l) - update["side_story"]]
-            del l[index1:index2 - update["other_song"]]
-            del l[:index1 - update["main_story"]]
-            logger.info(str(l))
-            env = Environment()
-            with ZipFile(path) as apk:
-                for key, entry in table:
-                    if key[:7] == "avatar.":
-                        env.load_file(BytesIO(apk.read("assets/aa/Android/%s" % entry)), name=key)
-                        continue
-                    for song_id in l:
-                        if key.startswith("%s.0/" % song_id):
-                            env.load_file(BytesIO(apk.read("assets/aa/Android/%s" % entry)), name=key)
-                            break
-            for i_key, i_entry in env.files.items():
-                save(i_key, i_entry, pool, logger, output_dirs, config)
+        index1 = l.index("Doppelganger.LeaF")
+        index2 = l.index("Poseidon.1112vsStar")
+        del l[index2:len(l) - update["side_story"]]
+        del l[index1:index2 - update["other_song"]]
+        del l[:index1 - update["main_story"]]
+        logger.info(str(l))
+        table = [(key, entry) for key, entry in table
+                 if key.startswith("avatar.") or any(key.startswith("%s.0/" % song_id) for song_id in l)]
+    with CheckedThreadPoolExecutor(max_workers=workers, thread_name_prefix="phigros-extract") as pool:
+        for item in sorted(set(map(tuple, table))):
+            pool.submit(_extract_bundle, item, path, logger, output_dirs, config)
     logger.info("%f秒" % round(time.time() - ti, 4))
 
 

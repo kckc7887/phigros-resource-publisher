@@ -1,17 +1,15 @@
 name: Phigros 全量发布
 
-# 唯一工作流：手动触发，完成 下载最新 APK → 全量解包（含全曲音乐）→ 全量上传。
+# 每天北京时间 08:00 检查资源；GitHub schedule 使用 UTC，实际启动可能排队延迟。
 on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
 
 permissions:
   contents: read
-
-concurrency:
-  group: phigros-publish
-  cancel-in-progress: false
 
 jobs:
   validate:
@@ -27,9 +25,12 @@ jobs:
       - run: python -m unittest discover -s tests -v
 
   publish:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     needs: validate
-    name: 下载-全量解包-全量上传
+    concurrency:
+      group: phigros-publish
+      cancel-in-progress: false
+    name: 下载-并行解析-清单比较-安全发布
     runs-on: ubuntu-latest
     timeout-minutes: 360  # 平台上限 6 小时：runner 在海外，跨境下载/上传都慢，留足余量
     steps:
@@ -57,7 +58,7 @@ jobs:
       - name: 安装依赖
         run: python -m pip install -r requirements.txt
 
-      - name: 下载并全量解包并全量上传
+      - name: 下载并行解析并安全发布
         env:
           S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
@@ -66,6 +67,7 @@ jobs:
           S3_PUBLIC_BASE: ${{ secrets.S3_PUBLIC_BASE }}
           # 可选：在 Settings → Variables 里建 S3_UPLOAD_WORKERS 调整并行上传线程数（默认 8）
           S3_UPLOAD_WORKERS: ${{ vars.S3_UPLOAD_WORKERS }}
+          PHIGROS_PARSE_WORKERS: ${{ vars.PHIGROS_PARSE_WORKERS }}
         run: python publish.py
 
       - name: 归档发布清单

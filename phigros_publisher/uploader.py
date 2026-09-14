@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import mimetypes
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-import threading
 from typing import Any, Callable
 from .organizer import validate_release
+from .storage_check import verify_conditional_writes
 
 
 UPLOAD_SCOPES = {
-    "all": "全部资源（上传后清空 releases，仅保留本次）",
+    "all": "校验清单，变化时完整发布并清理切换前的旧发布快照",
     "current": "仅 current.json",
     "catalog": "仅 catalog.json",
     "manifest": "仅 manifest.json",
@@ -44,8 +46,10 @@ def _make_s3_client(boto3: Any, Config: Any, config: dict[str, Any]) -> Any:
     config_kwargs: dict[str, Any] = {
         "signature_version": "s3v4",
         "s3": {"addressing_style": "path"},
-        # 跨境链路抖动重试：自适应模式，最多 10 次尝试。
-        "retries": {"max_attempts": 10, "mode": "adaptive"},
+        "retries": {"total_max_attempts": 5, "mode": "standard"},
+        "connect_timeout": 15,
+        "read_timeout": 120,
+        "max_pool_connections": max(8, int(config.get("max_workers") or 8)),
     }
     # boto3>=1.36 默认改用 CRC；兼容端常仍强制 DeleteObjects 要 Content-MD5。
     try:
@@ -139,6 +143,208 @@ def iter_upload_files(
     return selected
 
 
+CURRENT_KEY = "phigros/current.json"
+MAX_JSON_BYTES = 32 * 1024 * 1024
+
+
+def _release_prefix(current: dict[str, Any]) -> str:
+    key = current.get("manifest", "")
+    if not isinstance(key, str) or not re.fullmatch(r"phigros/releases/[A-Za-z0-9][A-Za-z0-9._-]*/manifest\.json", key):
+        raise ValueError("current 清单路径不属于独立 Phigros 发布目录")
+    prefix = key.rsplit("/", 1)[0] + "/"
+    for name, suffix in (("catalog", "catalog.json"), ("noteCounts", "metadata/note_counts.tsv")):
+        if current.get(name, prefix + suffix if name == "noteCounts" else None) != prefix + suffix:
+            raise ValueError("current 资源路径不在同一发布目录")
+    return prefix
+
+
+def _manifest_identity(manifest: dict[str, Any]) -> tuple:
+    if (type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 1
+            or not isinstance(manifest.get("gameVersion"), str) or not manifest["gameVersion"].strip()):
+        raise ValueError("清单版本无效")
+    assets = manifest.get("assets")
+    if not isinstance(assets, list) or not assets:
+        raise ValueError("资源清单为空")
+    rows = []
+    seen = set()
+    for asset in assets:
+        if not isinstance(asset, dict):
+            raise ValueError("资源清单条目无效")
+        path, size, digest = asset.get("path"), asset.get("size"), asset.get("sha256")
+        if (not isinstance(path, str) or not path or "\\" in path or ":" in path
+                or any(part in ("", ".", "..") for part in path.split("/"))
+                or path == "manifest.json" or path in seen
+                or not isinstance(size, int) or isinstance(size, bool) or size <= 0
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not isinstance(asset.get("contentType"), str)):
+            raise ValueError("资源清单路径、大小或 SHA-256 无效")
+        seen.add(path)
+        rows.append((path, size, digest, asset["contentType"]))
+    if (type(manifest.get("assetCount")) is not int or type(manifest.get("totalBytes")) is not int
+            or manifest["assetCount"] != len(rows) or manifest["totalBytes"] != sum(row[1] for row in rows)):
+        raise ValueError("资源清单统计不一致")
+    return manifest["gameVersion"], tuple(sorted(rows))
+
+
+def _is_missing(error: Exception) -> bool:
+    response = getattr(error, "response", {})
+    return (response.get("Error", {}).get("Code") in {"NoSuchKey", "NotFound", "404"}
+            or response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404)
+
+
+def _get_bytes(client: Any, bucket: str, key: str, *, missing_ok: bool = False) -> tuple[bytes, str] | None:
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+    except Exception as error:
+        if missing_ok and _is_missing(error):
+            return None
+        raise
+    body = response["Body"]
+    try:
+        data = body.read(MAX_JSON_BYTES + 1)
+        if len(data) > MAX_JSON_BYTES:
+            raise ValueError(f"远端 JSON 过大：{key}")
+        if response.get("ContentLength", len(data)) != len(data):
+            raise ValueError(f"远端 JSON 长度不一致：{key}")
+        return data, response.get("ETag", "")
+    finally:
+        body.close()
+
+
+def _baseline(client: Any, bucket: str) -> dict[str, Any]:
+    result = {"etag": None, "current": None, "manifest": None, "prefix": None}
+    remote = _get_bytes(client, bucket, CURRENT_KEY, missing_ok=True)
+    if remote is None:
+        return result
+    raw, etag = remote
+    if not isinstance(etag, str) or not etag:
+        raise ValueError("现有 current 缺少 ETag，无法安全进行条件切换")
+    result["etag"] = etag
+    try:
+        current = json.loads(raw)
+        prefix = _release_prefix(current)
+    except (ValueError, TypeError, AttributeError):
+        return result
+    result.update(current=current, prefix=prefix)
+    remote_manifest = _get_bytes(client, bucket, current["manifest"], missing_ok=True)
+    if remote_manifest is None:
+        return result
+    try:
+        manifest_bytes = remote_manifest[0]
+        if hashlib.sha256(manifest_bytes).hexdigest() != current.get("manifestSha256"):
+            return result
+        manifest = json.loads(manifest_bytes)
+        manifest_text = manifest_bytes.decode("utf-8")
+        _manifest_identity(manifest)
+        if (type(current.get("schemaVersion")) is not int or current["schemaVersion"] != 1
+                or manifest["gameVersion"] != current.get("gameVersion")
+                or manifest.get("generatedAt") != current.get("publishedAt")):
+            return result
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return result
+    return {"etag": etag, "current": current, "manifest": manifest, "prefix": prefix,
+            "manifest_text": manifest_text}
+
+
+def _snapshot(client: Any, bucket: str, prefix: str) -> list[str]:
+    keys = []
+    for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        for item in page.get("Contents", []):
+            key = item["Key"]
+            if not isinstance(key, str) or not key.startswith(prefix) or key == prefix:
+                raise ValueError("对象列表返回了发布快照之外的路径")
+            keys.append(key)
+    return sorted(set(keys))
+
+
+def _save_report(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _verify_object(client: Any, bucket: str, key: str, size: int, digest: str) -> None:
+    response = client.get_object(Bucket=bucket, Key=key)
+    body = response["Body"]
+    count, sha = 0, hashlib.sha256()
+    try:
+        if response.get("ContentLength") != size:
+            raise ValueError(f"远端资源大小不一致：{key}")
+        while chunk := body.read(4 * 1024 * 1024):
+            count += len(chunk)
+            sha.update(chunk)
+            if count > size:
+                raise ValueError(f"远端资源超过预期大小：{key}")
+        if count != size or sha.hexdigest() != digest:
+            raise ValueError(f"远端资源 SHA-256 校验失败：{key}")
+    finally:
+        body.close()
+
+
+def _parallel(items: list, workers: int, operation: Callable, completed: Callable) -> None:
+    """Keep at most twice the worker count queued, and observe every failure."""
+    iterator = iter(items)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="s3-publish") as pool:
+        pending = set()
+        try:
+            while True:
+                while len(pending) < workers * 2:
+                    try:
+                        item = next(iterator)
+                    except StopIteration:
+                        break
+                    pending.add(pool.submit(operation, item))
+                if not pending:
+                    return
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    completed(future.result())
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            raise
+
+
+def _cleanup(client: Any, bucket: str, report: dict[str, Any], report_path: Path) -> None:
+    remaining = list(report["cleanup_remaining"])
+    prefix = report.get("previous_prefix")
+    if remaining and (not isinstance(prefix, str) or not re.fullmatch(
+            r"phigros/releases/[A-Za-z0-9][A-Za-z0-9._-]*/", prefix)
+            or prefix == report.get("candidate_prefix")
+            or any(not key.startswith(prefix) or key == prefix for key in remaining)):
+        raise ValueError("拒绝删除发布快照之外的对象")
+    while remaining:
+        _assert_active(client, bucket, report)
+        batch = remaining[:1000]
+        response = client.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": key} for key in batch], "Quiet": False})
+        errors = response.get("Errors", [])
+        deleted = {item.get("Key") for item in response.get("Deleted", [])}
+        # S3 DeleteObjects can return HTTP 200 with individual object errors.
+        failed = {item.get("Key") for item in errors}
+        confirmed = set(batch) & deleted - failed
+        report["deleted_previous"] += len(confirmed)
+        remaining = [key for key in remaining if key not in confirmed]
+        report["cleanup_remaining"] = remaining
+        _save_report(report_path, report)
+        if failed or len(confirmed) != len(batch):
+            raise RuntimeError(f"旧发布清理未完成，剩余 {len(remaining)} 个对象；使用报告重试")
+    _assert_active(client, bucket, report)
+
+
+def _assert_active(client: Any, bucket: str, report: dict[str, Any]) -> None:
+    active = _get_bytes(client, bucket, CURRENT_KEY)
+    if (active is None or hashlib.sha256(active[0]).hexdigest() != report.get("candidate_current_sha256")
+            or _release_prefix(json.loads(active[0])) != report.get("candidate_prefix")):
+        raise ValueError("current 已改变，停止旧资源清理")
+
+
+def _assert_conditional_support(client: Any) -> None:
+    members = client.meta.service_model.operation_model("PutObject").input_shape.members
+    if not {"IfMatch", "IfNoneMatch"}.issubset(members):
+        raise RuntimeError("S3 SDK 缺少条件写入支持，请升级 boto3；禁止无条件切换")
+
+
 def upload_release(
     release_result: dict[str, Any],
     config: dict[str, Any],
@@ -148,144 +354,165 @@ def upload_release(
     missing = [key for key in required if not str(config.get(key, "")).strip()]
     if missing:
         raise ValueError(f"上传配置缺少：{', '.join(missing)}")
-
     scope = normalize_upload_scope(config.get("upload_scope"))
     if scope == "current":
         raise ValueError("仅更新 current.json 无法确认远端资源完整性，请使用全量上传")
-    validate_release(release_result)
+    validate_release(release_result, workers=int(config.get("parse_workers") or 4))
+    version_dir = Path(release_result["version_dir"])
+    current_bytes = Path(release_result["current_path"]).read_bytes()
+    current = json.loads(current_bytes)
+    prefix = _release_prefix(current)
+    manifest_path = version_dir / "manifest.json"
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    identity = _manifest_identity(manifest)
+    workers = int(config.get("max_workers") or 8)
+    if workers < 1 or workers > 32:
+        raise ValueError("上传并行数必须为 1-32")
+    report_path = Path(config.get("report_path") or Path(__file__).resolve().parents[1] / "work/artifacts/publication.json")
+    report = {
+        "schemaVersion": 1, "scope": scope, "status": "preparing", "bucket": config["bucket"],
+        "endpoint": config["endpoint"].rstrip("/"), "candidate_prefix": prefix,
+        "candidate_current_sha256": hashlib.sha256(current_bytes).hexdigest(),
+        "previous_prefix": None, "cleanup_remaining": [], "previous_keys": [],
+        "uploaded": 0, "verified": 0, "uploaded_bytes": 0, "deleted_previous": 0,
+        "keys": [], "unchanged": False, "pointer_verified": False, "commit_attempted": False,
+        "conditional_write_verified": False,
+        "current_url": (str(config.get("public_base", "")).rstrip("/") + "/" + CURRENT_KEY)
+                       if config.get("public_base") else None,
+    }
+    _save_report(report_path, report)
+    try:
+        boto3, Config = _load_boto3()
+        client = _make_s3_client(boto3, Config, {**config, "max_workers": workers})
+        previous = _baseline(client, config["bucket"])
+        report["baseline_etag"] = previous["etag"]
+        report["previous_prefix"] = previous["prefix"]
+        if scope == "all" and previous["manifest"] is not None and identity == _manifest_identity(previous["manifest"]):
+            report.update(status="unchanged", unchanged=True, active_current=previous["current"],
+                          active_manifest_text=previous["manifest_text"])
+            _save_report(report_path, report)
+            return report
+        if prefix == previous["prefix"]:
+            raise ValueError("候选发布不得覆盖正在使用的资源目录")
+        if scope == "all":
+            _assert_conditional_support(client)
+        # Fresh namespace is a hard precondition, including candidates from partial uploads.
+        if _snapshot(client, config["bucket"], prefix):
+            raise ValueError("候选发布目录已存在，请重新整理生成独立修订目录")
+        if scope == "all":
+            report["status"] = "checking_storage"
+            _save_report(report_path, report)
+            verify_conditional_writes(client, config["bucket"], "phigros")
+            report["conditional_write_verified"] = True
+        if scope == "all" and previous["prefix"]:
+            report["previous_keys"] = _snapshot(client, config["bucket"], previous["prefix"])
+        report["status"] = "uploading"
+        _save_report(report_path, report)
+        from boto3.s3.transfer import TransferConfig
+        transfer = TransferConfig(use_threads=False, max_concurrency=1)
+        asset_map = {asset["path"]: asset for asset in manifest["assets"]}
+        selected = [(path, relative) for path, relative in iter_upload_files(version_dir, scope) if relative != "manifest.json"]
+        total = len(selected) + (2 if scope == "all" else int(scope == "manifest"))
+        if not total:
+            raise ValueError(f"上传范围 {scope} 没有匹配到任何本地文件")
+
+        def upload_one(item: tuple[Path, str]) -> tuple[str, int]:
+            path, relative = item
+            asset = asset_map[relative]
+            key = prefix + relative
+            client.upload_file(str(path), config["bucket"], key,
+                               ExtraArgs={"ContentType": asset["contentType"],
+                                          "CacheControl": "public, max-age=31536000, immutable",
+                                          "Metadata": {"sha256": asset["sha256"]}}, Config=transfer)
+            _verify_object(client, config["bucket"], key, asset["size"], asset["sha256"])
+            return key, asset["size"]
+
+        def completed(item: tuple[str, int]) -> None:
+            key, size = item
+            report["keys"].append(key)
+            report["uploaded"] += 1
+            report["verified"] += 1
+            report["uploaded_bytes"] += size
+            if progress:
+                progress(report["uploaded"], total, key)
+
+        _parallel(selected, workers, upload_one, completed)
+        if scope in {"all", "manifest"}:
+            client.put_object(Bucket=config["bucket"], Key=current["manifest"], Body=manifest_bytes,
+                              ContentType="application/json", CacheControl="public, max-age=31536000, immutable",
+                              ContentMD5=base64.b64encode(hashlib.md5(manifest_bytes).digest()).decode("ascii"))
+            _verify_object(client, config["bucket"], current["manifest"], len(manifest_bytes), current["manifestSha256"])
+            completed((current["manifest"], len(manifest_bytes)))
+        if scope != "all":
+            report["status"] = "partial"
+            _save_report(report_path, report)
+            return report
+        report["status"] = "committing"
+        report["commit_attempted"] = True
+        _save_report(report_path, report)
+        condition = {"IfMatch": previous["etag"]} if previous["etag"] else {"IfNoneMatch": "*"}
+        client.put_object(Bucket=config["bucket"], Key=CURRENT_KEY, Body=current_bytes,
+                          ContentType="application/json", CacheControl="no-cache, max-age=0",
+                          ContentMD5=base64.b64encode(hashlib.md5(current_bytes).digest()).decode("ascii"), **condition)
+        actual = _get_bytes(client, config["bucket"], CURRENT_KEY)
+        if actual is None or actual[0] != current_bytes:
+            raise RuntimeError("发布指针回读不一致，停止清理旧资源")
+        report["pointer_verified"] = True
+        completed((CURRENT_KEY, len(current_bytes)))
+        report["status"] = "cleaning"
+        report["cleanup_remaining"] = list(report["previous_keys"]) if config.get("delete_previous", True) else []
+        _save_report(report_path, report)
+        _cleanup(client, config["bucket"], report, report_path)
+        report["status"] = "published"
+        _save_report(report_path, report)
+        return report
+    except BaseException as error:
+        report["status"] = "cleanup_failed" if report["pointer_verified"] else "failed"
+        report["error"] = str(error)
+        _save_report(report_path, report)
+        raise
+
+
+def retry_cleanup(report_path: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Retry only keys already captured before a verified pointer switch."""
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if (not report.get("pointer_verified") or report.get("bucket") != config["bucket"]
+            or report.get("endpoint") != config["endpoint"].rstrip("/")):
+        raise ValueError("报告尚未确认切换成功，或报告与当前 S3 配置不一致")
+    remaining, snapshot = report.get("cleanup_remaining"), report.get("previous_keys")
+    if (not isinstance(remaining, list) or not isinstance(snapshot, list)
+            or any(not isinstance(key, str) for key in remaining + snapshot)
+            or not set(remaining).issubset(set(snapshot))):
+        raise ValueError("清理报告不属于原始发布快照")
     boto3, Config = _load_boto3()
     client = _make_s3_client(boto3, Config, config)
-    bucket = config["bucket"]
-    version = release_result["version"]
-    version_dir = Path(release_result["version_dir"])
-    selected = iter_upload_files(version_dir, scope)
-    include_current = scope in {"all", "current"}
-    total = len(selected) + (1 if include_current else 0)
-    if total == 0:
-        raise ValueError(f"上传范围 {scope} 没有匹配到任何本地文件")
-
-    uploaded_keys: list[str] = []
-
-    def _upload_asset(s3_client: Any, path: Path, key: str) -> None:
-        content_type = (
-            _CONTENT_TYPE_OVERRIDES.get(path.suffix.lower())
-            or mimetypes.guess_type(path.name)[0]
-            or "application/octet-stream"
-        )
-        s3_client.upload_file(
-            str(path),
-            bucket,
-            key,
-            ExtraArgs={
-                "ContentType": content_type,
-                "CacheControl": "public, max-age=31536000, immutable",
-            },
-        )
-
+    active = _get_bytes(client, config["bucket"], CURRENT_KEY)
+    if active is None or hashlib.sha256(active[0]).hexdigest() != report.get("candidate_current_sha256"):
+        raise ValueError("current 已改变，拒绝使用过期报告自动清理")
+    if _release_prefix(json.loads(active[0])) != report.get("candidate_prefix"):
+        raise ValueError("清理报告的候选目录与 current 不一致")
     try:
-        max_workers = int(config.get("max_workers") or 8)
-    except (TypeError, ValueError):
-        max_workers = 8
-    max_workers = max(1, min(max_workers, 32))
-
-    if max_workers <= 1:
-        for index, (path, relative) in enumerate(selected, start=1):
-            key = f"phigros/releases/{version}/{relative}"
-            _upload_asset(client, path, key)
-            uploaded_keys.append(key)
-            if progress:
-                progress(index, total, key)
-    else:
-        # 跨境上传小文件多、延迟高，串行会被 RTT 拖垮；并行上传。
-        # boto3 客户端不建议跨线程共享使用：每线程独立持有客户端。
-        thread_local = threading.local()
-
-        def _thread_client() -> Any:
-            s3_client = getattr(thread_local, "client", None)
-            if s3_client is None:
-                s3_client = _make_s3_client(boto3, Config, config)
-                thread_local.client = s3_client
-            return s3_client
-
-        def _task(path: Path, key: str) -> str:
-            _upload_asset(_thread_client(), path, key)
-            return key
-
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="s3-upload") as pool:
-            futures = {
-                pool.submit(_task, path, f"phigros/releases/{version}/{relative}")
-                for path, relative in selected
-            }
-            for index, future in enumerate(as_completed(futures), start=1):
-                key = future.result()
-                uploaded_keys.append(key)
-                if progress:
-                    progress(index, total, key)
-
-    if include_current:
-        current_path = Path(release_result["current_path"])
-        if not current_path.is_file():
-            raise FileNotFoundError(f"缺少 current.json：{current_path}")
-        client.upload_file(
-            str(current_path),
-            bucket,
-            "phigros/current.json",
-            ExtraArgs={"ContentType": "application/json", "CacheControl": "no-cache, max-age=0"},
-        )
-        uploaded_keys.append("phigros/current.json")
-        if progress:
-            progress(total, total, "phigros/current.json")
-
-    deleted = 0
-    # 仅全量上传时清空 releases：删除不在本轮上传集合中的对象（含同版本孤儿与其他版本）。
-    if scope == "all" and config.get("delete_previous", True):
-        keep = {key for key in uploaded_keys if key.startswith(RELEASES_PREFIX)}
-        deleted = delete_stale_release_objects(client, bucket, keep)
-
-    public_base = str(config.get("public_base", "")).rstrip("/")
-    return {
-        "scope": scope,
-        "uploaded": len(uploaded_keys),
-        "keys": uploaded_keys,
-        "deleted_previous": deleted,
-        "current_url": f"{public_base}/phigros/current.json" if public_base and include_current else None,
-    }
+        _cleanup(client, config["bucket"], report, report_path)
+        report["status"] = "published"
+        report.pop("error", None)
+        _save_report(report_path, report)
+        return report
+    except BaseException as error:
+        report.update(status="cleanup_failed", error=str(error))
+        _save_report(report_path, report)
+        raise
 
 
-def delete_stale_release_objects(
-    client: Any,
-    bucket: str,
-    keep_keys: set[str],
-) -> int:
-    """Delete every object under phigros/releases/ that is not in keep_keys."""
-    paginator = client.get_paginator("list_objects_v2")
-    pending: list[dict[str, str]] = []
-    deleted = 0
+def main() -> None:
+    import argparse
+    from publish import _load_config
+    parser = argparse.ArgumentParser(description="从失败报告精准重试旧 Phigros 发布清理")
+    parser.add_argument("--retry-cleanup", type=Path, required=True)
+    args = parser.parse_args()
+    result = retry_cleanup(args.retry_cleanup, _load_config())
+    print(json.dumps({"status": result["status"], "remaining": len(result["cleanup_remaining"])}, ensure_ascii=False))
 
-    def flush() -> None:
-        nonlocal pending, deleted
-        if not pending:
-            return
-        try:
-            client.delete_objects(Bucket=bucket, Delete={"Objects": pending, "Quiet": True})
-            deleted += len(pending)
-        except Exception as error:
-            # 兼容端若仍拒批量删除，退回逐个删除，保证清理能完成。
-            message = str(error)
-            if "MissingContentMD5" not in message and "Content-Md5" not in message and "Content-MD5" not in message:
-                raise
-            for item in pending:
-                client.delete_object(Bucket=bucket, Key=item["Key"])
-                deleted += 1
-        pending = []
 
-    for page in paginator.paginate(Bucket=bucket, Prefix=RELEASES_PREFIX):
-        for item in page.get("Contents", []):
-            key = item["Key"]
-            if key in keep_keys:
-                continue
-            pending.append({"Key": key})
-            if len(pending) >= 1000:
-                flush()
-    flush()
-    return deleted
+if __name__ == "__main__":
+    main()

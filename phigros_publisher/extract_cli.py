@@ -8,6 +8,11 @@ import shutil
 import sys
 from pathlib import Path
 
+if __package__:
+    from .parallel import checked_workers
+else:
+    from parallel import checked_workers
+
 
 def _publish_extract_config(music: bool = False) -> dict:
     """Match Phigros_Resource defaults: charts on, music off unless requested."""
@@ -56,7 +61,8 @@ def preflight_audio() -> None:
         raise RuntimeError("音乐重建依赖不可用；Linux 需安装 libogg0、libvorbis0a、libvorbisenc2") from error
 
 
-def run_extract(script_dir: Path, apk_path: Path, music: bool = False) -> None:
+def run_extract(script_dir: Path, apk_path: Path, music: bool = False, workers: int = 4) -> None:
+    checked_workers(workers)
     os.chdir(script_dir)
     sys.path.insert(0, str(script_dir))
 
@@ -77,19 +83,21 @@ def run_extract(script_dir: Path, apk_path: Path, music: bool = False) -> None:
 
     action = "提取媒体资源（含 chart、music）" if music else "提取媒体资源（含 chart）"
     print(f"[*] {action}...", flush=True)
-    extract_resources(str(apk_path), config, logger, str(metadata_dir), {key: str(path) for key, path in output_dirs.items()})
+    extract_resources(str(apk_path), config, logger, str(metadata_dir),
+                      {key: str(path) for key, path in output_dirs.items()}, workers=workers)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phigros publisher extraction with charts enabled")
     parser.add_argument("script_dir", type=Path, help="phiTool script-py directory")
     parser.add_argument("apk_path", type=Path, help="APK file path")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel resource workers (1-16)")
     args = parser.parse_args()
     if not args.script_dir.is_dir():
         raise SystemExit(f"script_dir 不存在：{args.script_dir}")
     if not args.apk_path.is_file():
         raise SystemExit(f"APK 不存在：{args.apk_path}")
-    run_extract(args.script_dir.resolve(), args.apk_path.resolve())
+    run_extract(args.script_dir.resolve(), args.apk_path.resolve(), workers=args.workers)
 
 
 if __name__ == "__main__":
